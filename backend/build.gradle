@@ -69,6 +69,7 @@ spotless {
 
 spotbugs {
 	ignoreFailures = false
+	excludeFilter = file('config/spotbugs/exclude.xml')
 }
 
 tasks.named('spotbugsTest') {

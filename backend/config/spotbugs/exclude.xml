@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+    <!--
+      Spring services receive collaborators from the application context.
+      EI_EXPOSE_REP / EI_EXPOSE_REP2 assume potentially hostile callers
+      sharing mutable object references, which is not the trust boundary
+      for constructor-injected Spring collaborators such as JdbcTemplate
+      and Clock.
+
+      Keep these detectors enabled for non-service classes so genuine
+      mutable-state exposure remains detectable elsewhere.
+    -->
+    <Match>
+        <Annotation name="org.springframework.stereotype.Service"/>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+</FindBugsFilter>

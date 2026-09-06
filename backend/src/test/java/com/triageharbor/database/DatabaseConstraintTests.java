@@ -313,6 +313,62 @@ class DatabaseConstraintTests {
                                 now));
     }
 
+    @Test
+    void projectIngestKeyIsGenerated() {
+        UUID projectId = insertProject("Test Project");
+
+        assertThat(ingestKeyOf(projectId)).isNotNull();
+    }
+
+    @Test
+    void eachProjectReceivesADistinctIngestKey() {
+        UUID keyA = ingestKeyOf(insertProject("Project A"));
+        UUID keyB = ingestKeyOf(insertProject("Project B"));
+
+        assertThat(keyA).isNotEqualTo(keyB);
+    }
+
+    @Test
+    void duplicateProjectIngestKeyIsRejected() {
+        UUID projectA = insertProject("Project A");
+        UUID ingestKey = ingestKeyOf(projectA);
+
+        assertConstraintViolation(
+                "23505",
+                "projects_ingest_key_unique",
+                () ->
+                        jdbcTemplate.update(
+                                """
+                                INSERT INTO projects (id, name, ingest_key)
+                                VALUES (?, ?, ?)
+                                """,
+                                UUID.randomUUID(),
+                                "Project B",
+                                ingestKey));
+    }
+
+    @Test
+    void projectIngestKeyCannotBeNull() {
+        assertColumnViolation(
+                "23502",
+                "ingest_key",
+                () ->
+                        jdbcTemplate.update(
+                                """
+                                INSERT INTO projects (id, name, ingest_key)
+                                VALUES (?, ?, NULL)
+                                """,
+                                UUID.randomUUID(),
+                                "Test Project"));
+    }
+
+    private UUID ingestKeyOf(UUID projectId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT ingest_key FROM projects WHERE id = ?",
+                UUID.class,
+                projectId);
+    }
+
     private UUID insertProject(String name) {
         UUID id = UUID.randomUUID();
 
