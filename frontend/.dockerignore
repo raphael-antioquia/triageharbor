@@ -1,0 +1,27 @@
+# Unlike the backend image, the frontend is built from source inside Docker.
+# Keep the source tree in the context and block local/generated state instead.
+#
+# node_modules and dist are load-bearing exclusions: the build must start from
+# dependencies installed by npm ci and must not inspect a stale local Vite bundle.
+
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# VITE_PROJECT_ID must come from the explicit Docker build argument, never a
+# developer's local Vite environment file.
+.env
+.env.*
+*.local
+
+# Local/editor state is not part of the production build context.
+.vscode/
+.idea/
+.DS_Store
+
+# Package-manager diagnostic output.
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
