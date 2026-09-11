@@ -1,0 +1,37 @@
+{$SITE_ADDRESS} {
+	# Public ingestion boundary. Dashboard Basic Auth must not gate this route.
+	handle /events {
+		request_body {
+			max_size 512KiB
+		}
+
+		reverse_proxy backend:8080 {
+			# Deployment-level credentials belong to Caddy, not Spring.
+			header_up -Authorization
+		}
+	}
+
+	# Privileged dashboard/read API boundary.
+	# handle_path strips /api before proxying to Spring.
+	handle_path /api/* {
+		basic_auth {
+			{$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
+		}
+
+		reverse_proxy backend:8080 {
+			# Spring does not currently consume the deployment Basic credential.
+			header_up -Authorization
+		}
+	}
+
+	# Everything else is the authenticated React SPA.
+	handle {
+		basic_auth {
+			{$DASHBOARD_USER} {$DASHBOARD_PASSWORD_HASH}
+		}
+
+		root * /usr/share/caddy
+		try_files {path} /index.html
+		file_server
+	}
+}

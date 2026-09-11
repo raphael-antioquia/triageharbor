@@ -22,7 +22,9 @@ RUN test -n "$VITE_PROJECT_ID" \
 # Human-readable pin: caddy:2.11.4-alpine
 FROM caddy:2.11.4-alpine@sha256:5f5c8640aae01df9654968d946d8f1a56c497f1dd5c5cda4cf95ab7c14d58648 AS runtime
 
-# Step 5A only packages the static frontend artifact.
-# Step 5B will replace Caddy's default configuration with TriageHarbor's
-# committed routing and authentication boundary.
+# The reverse-proxy, authentication, and static-serving boundary is part of
+# the deployable image rather than host-mounted configuration.
+COPY Caddyfile /etc/caddy/Caddyfile
+
+# Copy the built React artifact into Caddy's static root.
 COPY --from=builder /app/dist/ /usr/share/caddy/
