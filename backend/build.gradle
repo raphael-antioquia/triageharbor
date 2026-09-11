@@ -47,6 +47,10 @@ tasks.named('test') {
 	}
 }
 
+tasks.named('bootJar') {
+	archiveFileName.set('app.jar')
+}
+
 spotless {
 	java {
 		trimTrailingWhitespace()

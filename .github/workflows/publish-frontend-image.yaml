@@ -1,0 +1,158 @@
+name: Publish Frontend Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend/**"
+      - ".github/workflows/publish-frontend-image.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.20.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend lint
+        run: npm run lint
+
+  publish:
+    needs: lint
+    runs-on: ubuntu-latest
+
+    # Only this job can write packages; npm install and lint run in the read-only job.
+    permissions:
+      contents: read
+      packages: write
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: frontend
+
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/triageharbor-frontend:${{ github.sha }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Read production project ID
+        run: |
+          # mapfile keeps blank lines as entries; $(cat) would strip trailing ones.
+          mapfile -t PROJECT_ID_LINES < production-project-id
+          if (( ${#PROJECT_ID_LINES[@]} != 1 )); then
+            echo "production-project-id must contain exactly one line" >&2
+            exit 1
+          fi
+          PROJECT_ID="${PROJECT_ID_LINES[0]}"
+          # Whole-string match: rejects whitespace, CR, and uppercase.
+          RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          if [[ ! $PROJECT_ID =~ $RE ]]; then
+            echo "production-project-id must be exactly one lowercase UUID" >&2
+            exit 1
+          fi
+          # Safe to write only after validation.
+          printf 'VITE_PROJECT_ID=%s\n' "$PROJECT_ID" >> "$GITHUB_ENV"
+
+      - name: Build frontend image
+        env:
+          DOCKER_BUILDKIT: "1"
+        run: |
+          docker build \
+            --build-arg "VITE_PROJECT_ID=$VITE_PROJECT_ID" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.title=TriageHarbor Frontend" \
+            --label "org.opencontainers.image.description=TriageHarbor incident dashboard and edge proxy" \
+            --label "io.github.raphael-antioquia.triageharbor.project-id=${VITE_PROJECT_ID}" \
+            --tag "$IMAGE" \
+            .
+
+      - name: Verify frontend image
+        run: |
+          docker run \
+            --rm \
+            --env "EXPECTED_PROJECT_ID=$VITE_PROJECT_ID" \
+            --entrypoint sh \
+            "$IMAGE" \
+            -c '
+              set -eu
+
+              test -f /usr/share/caddy/index.html
+              test -r /usr/share/caddy/index.html
+
+              find /usr/share/caddy \
+                -type f \
+                -name "*.js" \
+                -exec grep -lF "$EXPECTED_PROJECT_ID" {} \; \
+                | grep -q .
+
+              export SITE_ADDRESS=localhost
+              export DASHBOARD_USER=ci-validation
+              export DASHBOARD_PASSWORD_HASH="$(
+                printf "%s\n" "ci-validation-only" \
+                  | caddy hash-password --algorithm bcrypt
+              )"
+
+              caddy validate --config /etc/caddy/Caddyfile
+            '
+
+          IMAGE_SOURCE="$(
+            docker image inspect \
+              --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' \
+              "$IMAGE"
+          )"
+          test "$IMAGE_SOURCE" = "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
+          IMAGE_REVISION="$(
+            docker image inspect \
+              --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+              "$IMAGE"
+          )"
+          test "$IMAGE_REVISION" = "$GITHUB_SHA"
+
+          IMAGE_PROJECT_ID="$(
+            docker image inspect \
+              --format '{{ index .Config.Labels "io.github.raphael-antioquia.triageharbor.project-id" }}' \
+              "$IMAGE"
+          )"
+          test "$IMAGE_PROJECT_ID" = "$VITE_PROJECT_ID"
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" \
+            | docker login ghcr.io \
+                --username "${GITHUB_ACTOR}" \
+                --password-stdin
+
+      - name: Push frontend image
+        run: docker push "$IMAGE"
