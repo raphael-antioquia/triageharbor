@@ -32,11 +32,32 @@ services:
       timeout: 5s
       retries: 5
 
+  # BACKEND_DIGEST is a content digest, not a tag: sha256:<64 hex chars>.
+  # migrate and backend must resolve to the same immutable artifact.
+  migrate:
+    image: ghcr.io/raphael-antioquia/triageharbor-backend@${BACKEND_DIGEST:?BACKEND_DIGEST is required}
+    restart: "no"
+
+    environment:
+      TRIAGEHARBOR_MODE: migrate
+      SPRING_FLYWAY_ENABLED: "true"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:?DB_NAME is required}
+      DB_USER: ${DB_USER:?DB_USER is required}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   backend:
-    image: ghcr.io/raphael-antioquia/triageharbor-backend:${DEPLOY_SHA:?DEPLOY_SHA is required}
+    image: ghcr.io/raphael-antioquia/triageharbor-backend@${BACKEND_DIGEST:?BACKEND_DIGEST is required}
     restart: unless-stopped
 
     environment:
+      TRIAGEHARBOR_MODE: serve
+      SPRING_FLYWAY_ENABLED: "false"
       DB_HOST: postgres
       DB_PORT: "5432"
       DB_NAME: ${DB_NAME:?DB_NAME is required}
@@ -49,6 +70,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
   web:
     image: ghcr.io/raphael-antioquia/triageharbor-frontend:${FRONTEND_DEPLOY_SHA:?FRONTEND_DEPLOY_SHA is required}
