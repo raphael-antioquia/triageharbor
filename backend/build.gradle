@@ -64,7 +64,8 @@ spotless {
 			'*.yml',
 			'.gitignore',
 			'.gitattributes',
-			'../compose.yaml'
+			'../compose.yaml',
+			'../compose.prod.yaml'
 
 		trimTrailingWhitespace()
 		endWithNewline()
