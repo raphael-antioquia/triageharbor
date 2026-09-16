@@ -3,14 +3,14 @@
 #
 # Database identities are fixed:
 #   triageharbor_admin     image bootstrap superuser; postgres + role-bootstrap only
-#   triageharbor_migrator  Flyway; migrate only
+#   triageharbor_migrator  Flyway + explicit project provisioning
 #   triageharbor_app       runtime; migrate context + backend
 #
 # Database role commissioning on an EMPTY volume:
 #   1. up -d --wait postgres
 #   2. --profile role-bootstrap run --rm role-bootstrap
 #   3. run --rm migrate
-#   4. project provisioning (as triageharbor_migrator; mechanism not yet built)
+#   4. --profile project-provision run --rm -T project-provision
 #   5. up -d
 #
 # role-bootstrap provisions database identities only; it is one stage of
@@ -99,6 +99,54 @@ services:
       DB_PASSWORD: ${DB_APP_PASSWORD:?DB_APP_PASSWORD is required}
       DB_MIGRATOR_USER: triageharbor_migrator
       DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?DB_MIGRATOR_PASSWORD is required}
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Operator-invoked project provisioning. Run after migrate during commissioning.
+  # Converges the frontend's configured project as triageharbor_migrator.
+  project-provision:
+    image: postgres:17.11
+    profiles: ["project-provision"]
+    restart: "no"
+    entrypoint: ["sh", "-ec"]
+
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${DB_NAME:?DB_NAME is required}
+      PGUSER: triageharbor_migrator
+      PGPASSWORD: ${DB_MIGRATOR_PASSWORD:?DB_MIGRATOR_PASSWORD is required}
+      PGAPPNAME: triageharbor-project-provision
+      PGCLIENTENCODING: UTF8
+      PROJECT_NAME: ${TRIAGEHARBOR_PROJECT_NAME:?TRIAGEHARBOR_PROJECT_NAME is required}
+
+    command:
+      - |
+        project_id="$$(cat /provision/production-project-id)"
+        exec psql \
+          -X \
+          -qAt \
+          -v ON_ERROR_STOP=1 \
+          -v project_id="$$project_id" \
+          -v project_name="$$PROJECT_NAME" \
+          -f /provision/provision-project.sql
+
+    volumes:
+      - type: bind
+        source: ./prod/postgres/provision-project.sql
+        target: /provision/provision-project.sql
+        read_only: true
+        bind:
+          create_host_path: false
+
+      - type: bind
+        source: ./frontend/production-project-id
+        target: /provision/production-project-id
+        read_only: true
+        bind:
+          create_host_path: false
 
     depends_on:
       postgres:
