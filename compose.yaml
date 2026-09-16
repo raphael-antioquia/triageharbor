@@ -9,8 +9,9 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./dev/postgres/01-role-bootstrap.sql:/docker-entrypoint-initdb.d/01-role-bootstrap.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U triageharbor -d triageharbor"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U triageharbor -d triageharbor"]
       interval: 5s
       timeout: 5s
       retries: 5

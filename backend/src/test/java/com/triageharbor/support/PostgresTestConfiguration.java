@@ -12,6 +12,8 @@ public class PostgresTestConfiguration {
     @Bean
     @ServiceConnection
     PostgreSQLContainer postgresContainer() {
-        return new PostgreSQLContainer(DockerImageName.parse("postgres:17.11"));
+        return new PostgreSQLContainer(DockerImageName.parse("postgres:17.11"))
+                .withDatabaseName("triageharbor")
+                .withInitScript("db/test-role-bootstrap.sql");
     }
 }
