@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.time.Instant;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -90,5 +91,42 @@ class EventIngestDerivationTests {
 
         assertThat(title.codePointCount(0, title.length())).isEqualTo(200);
         assertThat(title).isEqualTo("a".repeat(199) + "🙂");
+    }
+
+    @Test
+    void sanitizedEventFeedsFingerprintAndTitle() {
+        Instant occurredAt = Instant.parse("2026-01-01T10:00:00Z");
+
+        RedactedEvent redactedEvent =
+                RedactedEvent.from(
+                        new EventIngestRequest(
+                                occurredAt,
+                                "clientSecret=CANARY_TYPE_91b0aa",
+                                "password=CANARY_MSG_7f3a91,tail&more",
+                                "Caused by: Authorization: Bearer CANARY_TRACE_c2e8d4"));
+
+        assertThat(redactedEvent.occurredAt()).isEqualTo(occurredAt);
+
+        assertThat(redactedEvent.exceptionType())
+                .isEqualTo("clientSecret=[REDACTED]");
+
+        assertThat(redactedEvent.message())
+                .isEqualTo("password=[REDACTED]");
+
+        assertThat(redactedEvent.stackTrace())
+                .isEqualTo("Caused by: Authorization: [REDACTED]");
+
+        assertThat(
+                        EventFingerprintV1.compute(
+                                redactedEvent.exceptionType(),
+                                redactedEvent.message()))
+                .isEqualTo(
+                        "922f0af55a5c416555c2e8dc1cff07e4b3bb75c97f977f18b56fb938e3d87bf6");
+
+        assertThat(
+                        IncidentTitle.derive(
+                                redactedEvent.exceptionType(),
+                                redactedEvent.message()))
+                .isEqualTo("clientSecret=[REDACTED]");
     }
 }
