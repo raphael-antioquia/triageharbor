@@ -23,19 +23,21 @@ public class EventIngestService {
 
     @Transactional
     public void ingest(UUID ingestKey, EventIngestRequest request) {
+        RedactedEvent redactedEvent = RedactedEvent.from(request);
+
         UUID projectId = projectIdFor(ingestKey);
 
         Instant receivedAt = clock.instant();
 
         String fingerprint =
                 EventFingerprintV1.compute(
-                        request.exceptionType(),
-                        request.message());
+                        redactedEvent.exceptionType(),
+                        redactedEvent.message());
 
         String title =
                 IncidentTitle.derive(
-                        request.exceptionType(),
-                        request.message());
+                        redactedEvent.exceptionType(),
+                        redactedEvent.message());
 
         OffsetDateTime receivedAtUtc = toUtcOffset(receivedAt);
 
@@ -91,11 +93,11 @@ public class EventIngestService {
                 """,
                 projectId,
                 incidentId,
-                toUtcOffset(request.occurredAt()),
+                toUtcOffset(redactedEvent.occurredAt()),
                 receivedAtUtc,
-                request.exceptionType(),
-                request.message(),
-                request.stackTrace());
+                redactedEvent.exceptionType(),
+                redactedEvent.message(),
+                redactedEvent.stackTrace());
     }
 
     private UUID projectIdFor(UUID ingestKey) {
