@@ -16,6 +16,9 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(PostgresTestConfiguration.class)
@@ -233,6 +236,135 @@ class EventIngestControllerTests {
         assertThat(response.body()).isEmpty();
         assertThat(rowCount("incidents")).isZero();
         assertThat(rowCount("events")).isZero();
+    }
+
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void malformedJsonTokenDoesNotLeakIntoDiagnostics(CapturedOutput output)
+            throws Exception {
+        ProjectCredential project = insertProject("Project A");
+        String canary = "CANARY_JSON_TOKEN_8c2f";
+
+        HttpResponse<String> response =
+                postEvents(
+                        project.ingestKey().toString(),
+                        """
+                        {
+                          "occurredAt": "2026-09-05T20:00:00Z",
+                          "message": CANARY_JSON_TOKEN_8c2f
+                        }
+                        """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(response.body())
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+
+        assertThat(rowCount("incidents")).isZero();
+        assertThat(rowCount("events")).isZero();
+
+        assertThat(output.getAll())
+                .contains("Rejected unreadable POST /events request body")
+                .doesNotContain("DefaultHandlerExceptionResolver")
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+    }
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void invalidTimestampDoesNotLeakIntoDiagnostics(CapturedOutput output)
+            throws Exception {
+        ProjectCredential project = insertProject("Project A");
+        String canary = "CANARY_INVALID_INSTANT_47b9";
+
+        HttpResponse<String> response =
+                postEvents(
+                        project.ingestKey().toString(),
+                        """
+                        {
+                          "occurredAt": "CANARY_INVALID_INSTANT_47b9",
+                          "message": "Something failed"
+                        }
+                        """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(response.body())
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+
+        assertThat(rowCount("incidents")).isZero();
+        assertThat(rowCount("events")).isZero();
+
+        assertThat(output.getAll())
+                .contains("Rejected unreadable POST /events request body")
+                .doesNotContain("DefaultHandlerExceptionResolver")
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+    }
+
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void beanValidationDoesNotLeakEventContentIntoDiagnostics(
+            CapturedOutput output) throws Exception {
+        ProjectCredential project = insertProject("Project A");
+        String canary = "CANARY_VALIDATION_MSG_81ad";
+
+        HttpResponse<String> response =
+                postEvents(
+                        project.ingestKey().toString(),
+                        """
+                        {
+                          "message": "password=CANARY_VALIDATION_MSG_81ad"
+                        }
+                        """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(response.body())
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+
+        assertThat(rowCount("incidents")).isZero();
+        assertThat(rowCount("events")).isZero();
+
+        assertThat(output.getAll())
+                .contains("DefaultHandlerExceptionResolver")
+                .contains("MethodArgumentNotValidException")
+                .contains("occurredAt")
+                .doesNotContain(canary)
+                .doesNotContain(project.ingestKey().toString());
+    }
+
+    @Test
+    @ExtendWith(OutputCaptureExtension.class)
+    void successfulIngestDoesNotEmitCanariesInCapturedOutput(
+            CapturedOutput output) throws Exception {
+        ProjectCredential project = insertProject("Project A");
+
+        HttpResponse<String> response =
+                postEvents(
+                        project.ingestKey().toString(),
+                        """
+                        {
+                          "occurredAt": "2026-09-05T20:00:00Z",
+                          "exceptionType": "clientSecret=CANARY_SUCCESS_TYPE_2e8f",
+                          "message": "password=CANARY_SUCCESS_MSG_73c1",
+                          "stackTrace": "Authorization: Bearer CANARY_SUCCESS_TRACE_8b4e"
+                        }
+                        """);
+
+        assertThat(response.statusCode()).isEqualTo(202);
+        assertThat(response.body()).isEmpty();
+
+        assertThat(rowCount("incidents")).isEqualTo(1L);
+        assertThat(rowCount("events")).isEqualTo(1L);
+
+        assertThat(output.getAll())
+                .doesNotContain("CANARY_SUCCESS_TYPE_2e8f")
+                .doesNotContain("CANARY_SUCCESS_MSG_73c1")
+                .doesNotContain("CANARY_SUCCESS_TRACE_8b4e")
+                .doesNotContain(project.ingestKey().toString());
     }
 
     private HttpResponse<String> postEvents(
