@@ -11,14 +11,14 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.junit.jupiter.api.extension.ExtendWith;
-import org.springframework.boot.test.system.CapturedOutput;
-import org.springframework.boot.test.system.OutputCaptureExtension;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Import(PostgresTestConfiguration.class)
@@ -238,7 +238,6 @@ class EventIngestControllerTests {
         assertThat(rowCount("events")).isZero();
     }
 
-
     @Test
     @ExtendWith(OutputCaptureExtension.class)
     void malformedJsonTokenDoesNotLeakIntoDiagnostics(CapturedOutput output)
@@ -302,7 +301,6 @@ class EventIngestControllerTests {
                 .doesNotContain(canary)
                 .doesNotContain(project.ingestKey().toString());
     }
-
 
     @Test
     @ExtendWith(OutputCaptureExtension.class)
