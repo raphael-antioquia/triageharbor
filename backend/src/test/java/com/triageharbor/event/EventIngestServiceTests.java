@@ -40,6 +40,9 @@ class EventIngestServiceTests {
     private EventIngestService eventIngestService;
 
     @Autowired
+    private IngestCredentialResolver ingestCredentialResolver;
+
+    @Autowired
     private RecordingClock recordingClock;
 
     @BeforeEach
@@ -56,8 +59,11 @@ class EventIngestServiceTests {
     void validEventIsPersistedUnderProjectResolvedFromIngestKey() {
         ProjectCredential project = insertProject("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 request(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         "java.lang.IllegalStateException",
@@ -81,14 +87,17 @@ class EventIngestServiceTests {
     void repeatedIdenticalEventsIncrementOneIncidentAndAppendBothEvents() {
         ProjectCredential project = insertProject("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         EventIngestRequest request =
                 request(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         "java.lang.IllegalStateException",
                         "Something failed");
 
-        eventIngestService.ingest(project.ingestKey(), request);
-        eventIngestService.ingest(project.ingestKey(), request);
+        eventIngestService.ingest(authenticatedProject, request);
+        eventIngestService.ingest(authenticatedProject, request);
 
         Long incidentRows =
                 jdbcTemplate.queryForObject(
@@ -113,17 +122,21 @@ class EventIngestServiceTests {
     @Test
     void differentErrorsInOneProjectCreateSeparateIncidents() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         Instant occurredAt = Instant.parse("2026-01-01T10:00:00Z");
 
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 request(
                         occurredAt,
                         "java.lang.IllegalStateException",
                         "Something failed"));
 
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 request(
                         occurredAt,
                         "java.io.IOException",
@@ -138,14 +151,19 @@ class EventIngestServiceTests {
         ProjectCredential projectA = insertProject("Project A");
         ProjectCredential projectB = insertProject("Project B");
 
+        AuthenticatedProject authenticatedA =
+                ingestCredentialResolver.resolve(projectA.ingestKey());
+        AuthenticatedProject authenticatedB =
+                ingestCredentialResolver.resolve(projectB.ingestKey());
+
         EventIngestRequest request =
                 request(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         "java.lang.IllegalStateException",
                         "Something failed");
 
-        eventIngestService.ingest(projectA.ingestKey(), request);
-        eventIngestService.ingest(projectB.ingestKey(), request);
+        eventIngestService.ingest(authenticatedA, request);
+        eventIngestService.ingest(authenticatedB, request);
 
         Long incidentRows =
                 jdbcTemplate.queryForObject(
@@ -164,10 +182,14 @@ class EventIngestServiceTests {
     @Test
     void receivedAtIsCapturedOnceAndUsedForIncidentAndEvent() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         Instant occurredAt = Instant.parse("2020-01-01T00:00:00Z");
 
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 request(
                         occurredAt,
                         "java.lang.IllegalStateException",
@@ -208,6 +230,9 @@ class EventIngestServiceTests {
     void aggregateTimestampsAreIndependentOfArrivalOrder() {
         ProjectCredential project = insertProject("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         EventIngestRequest request =
                 request(
                         Instant.parse("2026-01-01T10:00:00Z"),
@@ -218,10 +243,10 @@ class EventIngestServiceTests {
         Instant earlier = Instant.parse("2026-09-05T19:00:00Z");
 
         recordingClock.setInstant(later);
-        eventIngestService.ingest(project.ingestKey(), request);
+        eventIngestService.ingest(authenticatedProject, request);
 
         recordingClock.setInstant(earlier);
-        eventIngestService.ingest(project.ingestKey(), request);
+        eventIngestService.ingest(authenticatedProject, request);
 
         OffsetDateTime firstSeen =
                 jdbcTemplate.queryForObject(
@@ -243,6 +268,9 @@ class EventIngestServiceTests {
     @Test
     void matchingOccurrenceDoesNotRewriteIncidentTitle() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
 
         String fingerprint =
                 EventFingerprintV1.compute(
@@ -270,7 +298,7 @@ class EventIngestServiceTests {
                 RECEIVED_AT.atOffset(ZoneOffset.UTC));
 
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 request(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         "java.lang.IllegalStateException",
@@ -291,27 +319,11 @@ class EventIngestServiceTests {
     }
 
     @Test
-    void unknownIngestKeyDoesNotPersistAnything() {
-        EventIngestRequest request =
-                request(
-                        Instant.parse("2026-01-01T10:00:00Z"),
-                        null,
-                        "Something failed");
-
-        assertThatThrownBy(
-                        () ->
-                                eventIngestService.ingest(
-                                        UUID.randomUUID(),
-                                        request))
-                .isInstanceOf(UnknownIngestKeyException.class);
-
-        assertThat(rowCount("incidents")).isZero();
-        assertThat(rowCount("events")).isZero();
-    }
-
-    @Test
     void eventInsertFailureRollsBackIncidentUpsert() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
 
         EventIngestRequest invalidRequest =
                 request(
@@ -322,7 +334,7 @@ class EventIngestServiceTests {
         assertThatThrownBy(
                         () ->
                                 eventIngestService.ingest(
-                                        project.ingestKey(),
+                                        authenticatedProject,
                                         invalidRequest))
                 .isInstanceOf(DataIntegrityViolationException.class);
 

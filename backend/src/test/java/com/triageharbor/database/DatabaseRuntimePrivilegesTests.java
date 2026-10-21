@@ -3,8 +3,10 @@ package com.triageharbor.database;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.triageharbor.event.AuthenticatedProject;
 import com.triageharbor.event.EventIngestRequest;
 import com.triageharbor.event.EventIngestService;
+import com.triageharbor.event.IngestCredentialResolver;
 import com.triageharbor.incident.IncidentReadService;
 import com.triageharbor.incident.IncidentSummary;
 import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
@@ -37,6 +39,9 @@ class DatabaseRuntimePrivilegesTests {
     private EventIngestService eventIngestService;
 
     @Autowired
+    private IngestCredentialResolver ingestCredentialResolver;
+
+    @Autowired
     private IncidentReadService incidentReadService;
 
     @Autowired
@@ -61,8 +66,11 @@ class DatabaseRuntimePrivilegesTests {
                         "Something failed",
                         "stack trace");
 
-        eventIngestService.ingest(project.ingestKey(), request);
-        eventIngestService.ingest(project.ingestKey(), request);
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
+        eventIngestService.ingest(authenticatedProject, request);
+        eventIngestService.ingest(authenticatedProject, request);
 
         List<IncidentSummary> incidents =
                 incidentReadService.listForProject(project.projectId());

@@ -1,5 +1,7 @@
 package com.triageharbor.event;
+
 import static org.assertj.core.api.Assertions.assertThat;
+
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.time.Duration;
 import java.time.Instant;
@@ -20,23 +22,32 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+
 @SpringBootTest
 @Import(PostgresTestConfiguration.class)
 class EventIngestConcurrencyTests {
+
     private static final int CONCURRENT_INGESTS = 50;
     private static final Duration READY_TIMEOUT = Duration.ofSeconds(10);
     private static final Duration BURST_TIMEOUT = Duration.ofSeconds(45);
     private static final Duration TERMINATION_TIMEOUT = Duration.ofSeconds(10);
+
     private static final EventIngestRequest MATCHING_REQUEST =
             new EventIngestRequest(
                     Instant.parse("2026-09-06T12:00:00Z"),
                     "java.lang.IllegalStateException",
                     "Something failed",
                     "stack trace");
+
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
     @Autowired
     private EventIngestService eventIngestService;
+
+    @Autowired
+    private IngestCredentialResolver ingestCredentialResolver;
+
     /*
      * Static so an unsafe state survives JUnit's default per-method
      * test-instance lifecycle within this class.
@@ -51,6 +62,7 @@ class EventIngestConcurrencyTests {
      * worse.
      */
     private static boolean databaseCleanupSafe = true;
+
     @BeforeEach
     void requireSafeDatabaseState() {
         assertThat(databaseCleanupSafe)
@@ -60,6 +72,7 @@ class EventIngestConcurrencyTests {
                                 + "PostgreSQL test context")
                 .isTrue();
     }
+
     @AfterEach
     void cleanUp() {
         if (!databaseCleanupSafe) {
@@ -67,67 +80,98 @@ class EventIngestConcurrencyTests {
         }
         jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
     }
+
     @Test
     void concurrentIngestsCreateOneIncidentWithoutLosingOccurrences() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         runConcurrentIngests(
-                project.ingestKey(),
+                authenticatedProject,
                 MATCHING_REQUEST,
                 CONCURRENT_INGESTS);
+
         assertThat(incidentCount(project.projectId()))
                 .as("concurrent creation must produce exactly one incident")
                 .isEqualTo(1L);
+
         assertThat(occurrenceCount(project.projectId()))
                 .as(
                         "all workers completed without failure, so a short "
                                 + "occurrence count would indicate a potential lost update")
                 .isEqualTo(CONCURRENT_INGESTS);
+
         assertThat(eventCount(project.projectId()))
                 .as("every accepted occurrence must append one event")
                 .isEqualTo(CONCURRENT_INGESTS);
     }
+
     @Test
     void concurrentIngestsUpdateExistingIncidentWithoutLosingOccurrences() {
         ProjectCredential project = insertProject("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 MATCHING_REQUEST);
+
         assertThat(incidentCount(project.projectId())).isEqualTo(1L);
         assertThat(occurrenceCount(project.projectId())).isEqualTo(1L);
         assertThat(eventCount(project.projectId())).isEqualTo(1L);
+
         runConcurrentIngests(
-                project.ingestKey(),
+                authenticatedProject,
                 MATCHING_REQUEST,
                 CONCURRENT_INGESTS);
+
         assertThat(incidentCount(project.projectId()))
                 .as("concurrent updates must not create another incident")
                 .isEqualTo(1L);
+
         assertThat(occurrenceCount(project.projectId()))
                 .as(
                         "all workers completed without failure, so a short "
                                 + "occurrence count would indicate a potential lost update")
                 .isEqualTo(CONCURRENT_INGESTS + 1L);
+
         assertThat(eventCount(project.projectId()))
                 .as("the seed plus every concurrent occurrence must be persisted")
                 .isEqualTo(CONCURRENT_INGESTS + 1L);
     }
+
+    /*
+     * Concurrent coverage targets the writer's atomic upsert;
+     * read-only concurrent credential lookups are intentionally
+     * not exercised here.
+     */
     private void runConcurrentIngests(
-            UUID ingestKey,
+            AuthenticatedProject authenticatedProject,
             EventIngestRequest request,
             int ingestCount) {
+
         ExecutorService executor =
                 Executors.newFixedThreadPool(ingestCount);
+
         CountDownLatch workersReady =
                 new CountDownLatch(ingestCount);
+
         CountDownLatch startGate =
                 new CountDownLatch(1);
+
         List<Future<Void>> futures =
                 new ArrayList<>(ingestCount);
+
         List<Throwable> failures =
                 new ArrayList<>();
+
         boolean abortWork = false;
         boolean restoreInterrupt = false;
         int nextUnobservedFuture = 0;
+
         try {
             try {
                 for (int index = 0; index < ingestCount; index++) {
@@ -136,17 +180,22 @@ class EventIngestConcurrencyTests {
                                     () -> {
                                         workersReady.countDown();
                                         startGate.await();
+
                                         eventIngestService.ingest(
-                                                ingestKey,
+                                                authenticatedProject,
                                                 request);
+
                                         return null;
                                     });
+
                     futures.add(future);
                 }
+
                 boolean allWorkersReady =
                         workersReady.await(
                                 READY_TIMEOUT.toMillis(),
                                 TimeUnit.MILLISECONDS);
+
                 if (!allWorkersReady) {
                     failures.add(
                             new IllegalStateException(
@@ -175,6 +224,7 @@ class EventIngestConcurrencyTests {
                 databaseCleanupSafe = false;
                 startGate.countDown();
             }
+
             if (!abortWork) {
                 /*
                  * One deadline for the whole burst rather than a fresh budget
@@ -183,13 +233,17 @@ class EventIngestConcurrencyTests {
                  */
                 long deadlineNanos =
                         System.nanoTime() + BURST_TIMEOUT.toNanos();
+
                 for (;
                         nextUnobservedFuture < futures.size();
                         nextUnobservedFuture++) {
+
                     Future<Void> future =
                             futures.get(nextUnobservedFuture);
+
                     long remainingNanos =
                             deadlineNanos - System.nanoTime();
+
                     if (remainingNanos <= 0L) {
                         failures.add(
                                 new IllegalStateException(
@@ -204,12 +258,14 @@ class EventIngestConcurrencyTests {
                         abortWork = true;
                         break;
                     }
+
                     try {
                         future.get(
                                 remainingNanos,
                                 TimeUnit.NANOSECONDS);
                     } catch (ExecutionException exception) {
                         Throwable cause = exception.getCause();
+
                         failures.add(
                                 cause != null
                                         ? cause
@@ -240,7 +296,9 @@ class EventIngestConcurrencyTests {
             } else {
                 executor.shutdown();
             }
+
             boolean terminated = false;
+
             try {
                 terminated =
                         executor.awaitTermination(
@@ -250,9 +308,11 @@ class EventIngestConcurrencyTests {
                 failures.add(exception);
                 restoreInterrupt = true;
             }
+
             if (!terminated) {
                 cancelUnfinished(futures);
                 executor.shutdownNow();
+
                 try {
                     terminated =
                             executor.awaitTermination(
@@ -263,7 +323,9 @@ class EventIngestConcurrencyTests {
                     restoreInterrupt = true;
                 }
             }
+
             databaseCleanupSafe = terminated;
+
             if (!terminated) {
                 failures.add(
                         new IllegalStateException(
@@ -272,6 +334,7 @@ class EventIngestConcurrencyTests {
                                         + "because workers may still hold "
                                         + "PostgreSQL locks."));
             }
+
             /*
              * If we stopped waiting early, collect failures from any remaining
              * workers that did terminate. Do not block here: termination has
@@ -281,14 +344,18 @@ class EventIngestConcurrencyTests {
                 for (int index = nextUnobservedFuture;
                         index < futures.size();
                         index++) {
+
                     Future<Void> future = futures.get(index);
+
                     if (!future.isDone() || future.isCancelled()) {
                         continue;
                     }
+
                     try {
                         future.get();
                     } catch (ExecutionException exception) {
                         Throwable cause = exception.getCause();
+
                         failures.add(
                                 cause != null
                                         ? cause
@@ -299,59 +366,76 @@ class EventIngestConcurrencyTests {
                     }
                 }
             }
+
             if (restoreInterrupt) {
                 Thread.currentThread().interrupt();
             }
         }
+
         throwIfFailures(failures);
     }
+
     private static void cancelUnfinished(
             List<Future<Void>> futures) {
+
         for (Future<Void> future : futures) {
             if (!future.isDone()) {
                 future.cancel(true);
             }
         }
     }
+
     private static void throwIfFailures(
             List<Throwable> failures) {
+
         if (failures.isEmpty()) {
             return;
         }
+
         StringBuilder message =
                 new StringBuilder(
                         "Concurrent ingest workers produced "
                                 + failures.size()
                                 + " failure(s):");
+
         for (Throwable failure : failures) {
             message.append(System.lineSeparator())
                     .append(" - ")
                     .append(failure.getClass().getSimpleName());
+
             if (failure.getMessage() != null) {
                 message.append(": ")
                         .append(failure.getMessage());
             }
         }
+
         AssertionError error =
                 new AssertionError(message.toString());
+
         for (Throwable failure : failures) {
             error.addSuppressed(failure);
         }
+
         throw error;
     }
+
     private ProjectCredential insertProject(String name) {
         UUID projectId = UUID.randomUUID();
+
         jdbcTemplate.update(
                 "INSERT INTO projects (id, name) VALUES (?, ?)",
                 projectId,
                 name);
+
         UUID ingestKey =
                 jdbcTemplate.queryForObject(
                         "SELECT ingest_key FROM projects WHERE id = ?",
                         UUID.class,
                         projectId);
+
         return new ProjectCredential(projectId, ingestKey);
     }
+
     private long incidentCount(UUID projectId) {
         Long count =
                 jdbcTemplate.queryForObject(
@@ -362,8 +446,10 @@ class EventIngestConcurrencyTests {
                         """,
                         Long.class,
                         projectId);
+
         return count;
     }
+
     private long occurrenceCount(UUID projectId) {
         Long count =
                 jdbcTemplate.queryForObject(
@@ -374,8 +460,10 @@ class EventIngestConcurrencyTests {
                         """,
                         Long.class,
                         projectId);
+
         return count;
     }
+
     private long eventCount(UUID projectId) {
         Long count =
                 jdbcTemplate.queryForObject(
@@ -386,8 +474,10 @@ class EventIngestConcurrencyTests {
                         """,
                         Long.class,
                         projectId);
+
         return count;
     }
+
     private record ProjectCredential(
             UUID projectId,
             UUID ingestKey) {}

@@ -22,9 +22,13 @@ final class EventIngestController {
 
     static final String INGEST_KEY_HEADER = "X-TriageHarbor-Ingest-Key";
 
+    private final IngestCredentialResolver ingestCredentialResolver;
     private final EventIngestService eventIngestService;
 
-    EventIngestController(EventIngestService eventIngestService) {
+    EventIngestController(
+            IngestCredentialResolver ingestCredentialResolver,
+            EventIngestService eventIngestService) {
+        this.ingestCredentialResolver = ingestCredentialResolver;
         this.eventIngestService = eventIngestService;
     }
 
@@ -39,11 +43,15 @@ final class EventIngestController {
             return unauthorized();
         }
 
+        AuthenticatedProject project;
+
         try {
-            eventIngestService.ingest(ingestKey, request);
+            project = ingestCredentialResolver.resolve(ingestKey);
         } catch (UnknownIngestKeyException exception) {
             return unauthorized();
         }
+
+        eventIngestService.ingest(project, request);
 
         return ResponseEntity.accepted().build();
     }

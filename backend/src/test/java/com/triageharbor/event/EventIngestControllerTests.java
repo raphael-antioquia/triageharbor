@@ -99,6 +99,22 @@ class EventIngestControllerTests {
     }
 
     @Test
+    void invalidBeanWithoutIngestKeyReturnsBadRequest() throws Exception {
+        HttpResponse<String> response =
+                postEvents(
+                        null,
+                        """
+                        {
+                          "message": "Something failed"
+                        }
+                        """);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(rowCount("incidents")).isZero();
+        assertThat(rowCount("events")).isZero();
+    }
+
+    @Test
     void missingOccurredAtReturnsBadRequestWithoutEchoingEventContent() throws Exception {
         ProjectCredential project = insertProject("Project A");
 
