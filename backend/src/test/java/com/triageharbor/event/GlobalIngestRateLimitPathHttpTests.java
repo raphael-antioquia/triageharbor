@@ -93,6 +93,36 @@ class GlobalIngestRateLimitPathHttpTests {
                 });
     }
 
+    @ParameterizedTest(name = "{0} /events -> {1}, charged once")
+    @CsvSource({
+        "GET,     405",
+        "HEAD,    405",
+        "OPTIONS, 200",
+        "PUT,     405",
+        "PATCH,   405",
+        "DELETE,  405"
+    })
+    void everyMethodOnEventsSpendsExactlyOneToken(String method, int expectedStatus)
+            throws Exception {
+
+        timeMeter.advance(Duration.ofMinutes(5));
+
+        int status = sendWithoutBody(method, "/events").statusCode();
+        int remaining = canonicalAdmissionsUntilExhausted();
+
+        assertSoftly(
+                softly -> {
+                    softly.assertThat(status)
+                            .as("status for %s /events", method)
+                            .isEqualTo(expectedStatus);
+
+                    // 2 left = unmetered; 0 left = charged twice.
+                    softly.assertThat(remaining)
+                            .as("%s /events must spend exactly one token", method)
+                            .isEqualTo(CAPACITY - 1);
+                });
+    }
+
     private int canonicalAdmissionsUntilExhausted() throws Exception {
         for (int admitted = 0; admitted <= CAPACITY; admitted++) {
             int status = send("/events").statusCode();
@@ -112,6 +142,16 @@ class GlobalIngestRateLimitPathHttpTests {
                 HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
                         .header("Content-Type", "application/json")
                         .POST(BodyPublishers.ofString(VALID_BODY))
+                        .build();
+
+        return HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.discarding());
+    }
+
+    private HttpResponse<Void> sendWithoutBody(String method, String path)
+            throws Exception {
+        HttpRequest request =
+                HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                        .method(method, BodyPublishers.noBody())
                         .build();
 
         return HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.discarding());
