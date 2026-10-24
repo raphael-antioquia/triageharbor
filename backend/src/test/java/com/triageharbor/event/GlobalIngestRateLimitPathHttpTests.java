@@ -10,8 +10,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -119,6 +121,49 @@ class GlobalIngestRateLimitPathHttpTests {
                     // 2 left = unmetered; 0 left = charged twice.
                     softly.assertThat(remaining)
                             .as("%s /events must spend exactly one token", method)
+                            .isEqualTo(CAPACITY - 1);
+                });
+    }
+
+    @Test
+    void oversizedFormEncodedPutReturns413AfterAdmission() throws Exception {
+        // Each test starts with a fully refilled two-token bucket.
+        timeMeter.advance(Duration.ofMinutes(5));
+
+        // "payload=" is 8 ASCII bytes, so the body is strictly over 256 KiB.
+        byte[] body =
+                ("payload=" + "x".repeat(EventRequestSizeFilter.MAX_REQUEST_BYTES))
+                        .getBytes(StandardCharsets.UTF_8);
+
+        assertThat(body.length)
+                .isGreaterThan(EventRequestSizeFilter.MAX_REQUEST_BYTES);
+
+        HttpRequest request =
+                HttpRequest.newBuilder(
+                                URI.create("http://localhost:" + port + "/events"))
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .PUT(BodyPublishers.ofByteArray(body))
+                        .build();
+
+        HttpResponse<byte[]> response =
+                HTTP_CLIENT.send(
+                        request,
+                        HttpResponse.BodyHandlers.ofByteArray());
+
+        int remaining = canonicalAdmissionsUntilExhausted();
+
+        assertSoftly(
+                softly -> {
+                    softly.assertThat(response.statusCode())
+                            .as("oversized form-encoded PUT status")
+                            .isEqualTo(413);
+
+                    softly.assertThat(response.body())
+                            .as("oversized form-encoded PUT response body")
+                            .isEmpty();
+
+                    softly.assertThat(remaining)
+                            .as("oversized form-encoded PUT spends one global token")
                             .isEqualTo(CAPACITY - 1);
                 });
     }
