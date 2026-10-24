@@ -54,6 +54,7 @@ tasks.named('bootJar') {
 
 spotless {
 	java {
+		leadingTabsToSpaces(4)
 		trimTrailingWhitespace()
 		endWithNewline()
 	}
