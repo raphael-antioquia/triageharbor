@@ -15,8 +15,6 @@ import org.springframework.web.filter.OncePerRequestFilter;
 
 final class GlobalIngestRateLimitFilter extends OncePerRequestFilter {
 
-    private static final long NANOS_PER_SECOND = 1_000_000_000L;
-
     private final Bucket bucket;
 
     GlobalIngestRateLimitFilter(
@@ -49,16 +47,9 @@ final class GlobalIngestRateLimitFilter extends OncePerRequestFilter {
             return;
         }
 
-        long retryAfterSeconds =
-                Math.max(
-                        1L,
-                        Math.ceilDiv(
-                                probe.getNanosToWaitForRefill(),
-                                NANOS_PER_SECOND));
-
         response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
         response.setHeader(
                 HttpHeaders.RETRY_AFTER,
-                Long.toString(retryAfterSeconds));
+                Long.toString(IngestRetryAfter.seconds(probe)));
     }
 }

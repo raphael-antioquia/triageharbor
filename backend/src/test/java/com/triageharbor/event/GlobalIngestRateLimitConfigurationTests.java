@@ -101,7 +101,7 @@ class GlobalIngestRateLimitConfigurationTests {
                                 "refillTokensPerMinute"));
     }
 
-    private static void assertPositiveViolations(
+    static void assertPositiveViolations(
             Throwable failure, String... expectedFields) {
 
         assertThat(failure).isNotNull();
