@@ -5,7 +5,6 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.UUID;
-import org.springframework.dao.EmptyResultDataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -22,10 +21,10 @@ public class EventIngestService {
     }
 
     @Transactional
-    public void ingest(UUID ingestKey, EventIngestRequest request) {
+    public void ingest(AuthenticatedProject project, EventIngestRequest request) {
         RedactedEvent redactedEvent = RedactedEvent.from(request);
 
-        UUID projectId = projectIdFor(ingestKey);
+        UUID projectId = project.id();
 
         Instant receivedAt = clock.instant();
 
@@ -98,21 +97,6 @@ public class EventIngestService {
                 redactedEvent.exceptionType(),
                 redactedEvent.message(),
                 redactedEvent.stackTrace());
-    }
-
-    private UUID projectIdFor(UUID ingestKey) {
-        try {
-            return jdbcTemplate.queryForObject(
-                    """
-                    SELECT id
-                    FROM projects
-                    WHERE ingest_key = ?
-                    """,
-                    UUID.class,
-                    ingestKey);
-        } catch (EmptyResultDataAccessException exception) {
-            throw new UnknownIngestKeyException();
-        }
     }
 
     private static OffsetDateTime toUtcOffset(Instant instant) {

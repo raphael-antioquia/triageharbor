@@ -26,6 +26,9 @@ class EventIngestPersistenceScrubbingTests {
     private EventIngestService eventIngestService;
 
     @Autowired
+    private IngestCredentialResolver ingestCredentialResolver;
+
+    @Autowired
     private PostgreSQLContainer postgresContainer;
 
     @AfterEach
@@ -40,8 +43,11 @@ class EventIngestPersistenceScrubbingTests {
     void persistedEventAndIncidentContainSanitizedValues() throws SQLException {
         ProjectCredential project = insertProjectAsAdmin("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 new EventIngestRequest(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         "clientSecret=CANARY_TYPE_91b0aa",
@@ -128,9 +134,12 @@ class EventIngestPersistenceScrubbingTests {
     void differentRawSecretsGroupBySanitizedFingerprint() throws SQLException {
         ProjectCredential project = insertProjectAsAdmin("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         for (String suffix : new String[] {"FIRST_91ab", "SECOND_73cd"}) {
             eventIngestService.ingest(
-                    project.ingestKey(),
+                    authenticatedProject,
                     new EventIngestRequest(
                             Instant.parse("2026-01-01T10:00:00Z"),
                             "clientSecret=CANARY_TYPE_" + suffix,
@@ -204,8 +213,11 @@ class EventIngestPersistenceScrubbingTests {
             throws SQLException {
         ProjectCredential project = insertProjectAsAdmin("Project A");
 
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
         eventIngestService.ingest(
-                project.ingestKey(),
+                authenticatedProject,
                 new EventIngestRequest(
                         Instant.parse("2026-01-01T10:00:00Z"),
                         null,

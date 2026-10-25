@@ -13,6 +13,9 @@ class EventRequestSizeFilterConfiguration {
                 new FilterRegistrationBean<>(new EventRequestSizeFilter());
 
         registration.addUrlPatterns("/events");
+        registration.setOrder(
+                GlobalIngestRateLimitConfiguration.GLOBAL_FILTER_ORDER + 1);
+
         return registration;
     }
 }

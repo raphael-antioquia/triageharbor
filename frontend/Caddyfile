@@ -2,7 +2,7 @@
 	# Public ingestion boundary. Dashboard Basic Auth must not gate this route.
 	handle /events {
 		request_body {
-			max_size 512KiB
+			max_size 256KiB
 		}
 
 		reverse_proxy backend:8080 {
