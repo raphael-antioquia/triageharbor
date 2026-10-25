@@ -116,21 +116,22 @@ class PerProjectIngestRateLimitHttpTests {
         assertThat(count("events", b.projectId())).isEqualTo(1L);
 
         meterRegistry.find(IngestRejectionMetrics.NAME)
-        .meters()
-        .forEach(meter -> {
-            Meter.Id id = meter.getId();
+                .meters()
+                .forEach(
+                        meter -> {
+                            Meter.Id id = meter.getId();
 
-            assertThat(id.getTag("reason"))
-                    .isIn("global", "project");
+                            assertThat(id.getTag("reason"))
+                                    .isIn("global", "project");
 
-            assertThat(id.getTag("project_id"))
-                    .isNotNull();
+                            assertThat(id.getTag("project_id"))
+                                    .isNotNull();
 
-            assertThat(id.toString())
-                    .doesNotContain(canary)
-                    .doesNotContain(a.ingestKey().toString())
-                    .doesNotContain(b.ingestKey().toString());
-        });
+                            assertThat(id.toString())
+                                    .doesNotContain(canary)
+                                    .doesNotContain(a.ingestKey().toString())
+                                    .doesNotContain(b.ingestKey().toString());
+                        });
 
         assertThat(output.getAll())
                 .doesNotContain(canary)
@@ -167,10 +168,11 @@ class PerProjectIngestRateLimitHttpTests {
         // Invalid requests and successful admission must not count as rejections.
         assertThat(rejectionCount("project", project.projectId().toString()))
                 .isZero();
-                assertThat(post(
-                                project.ingestKey().toString(),
-                                validBody("Second valid event")).statusCode())
-                        .isEqualTo(429);
+
+        assertThat(post(
+                        project.ingestKey().toString(),
+                        validBody("Second valid event")).statusCode())
+                .isEqualTo(429);
 
         assertThat(rejectionCount("project", project.projectId().toString()))
                 .isEqualTo(1.0);

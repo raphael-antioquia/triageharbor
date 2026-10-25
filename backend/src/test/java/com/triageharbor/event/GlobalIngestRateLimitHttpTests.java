@@ -66,7 +66,6 @@ class GlobalIngestRateLimitHttpTests {
                                 .method("OPTIONS", BodyPublishers.noBody())
                                 .build());
 
-
         assertThat(options.statusCode()).isEqualTo(200);
 
         // Admitted requests spend tokens but are not rejections.

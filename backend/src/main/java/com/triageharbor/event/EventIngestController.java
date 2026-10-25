@@ -67,7 +67,8 @@ final class EventIngestController {
         if (!probe.isConsumed()) {
             rejectionMetrics.recordProject(project);
 
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header(
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header(
                             HttpHeaders.RETRY_AFTER,
                             Long.toString(IngestRetryAfter.seconds(probe)))
                     .build();

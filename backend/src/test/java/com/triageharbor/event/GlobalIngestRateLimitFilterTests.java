@@ -26,10 +26,10 @@ class GlobalIngestRateLimitFilterTests {
     void exactlyCapacityRequestsAreAdmittedWithoutRefill() throws Exception {
         ManualTimeMeter timeMeter = new ManualTimeMeter();
         GlobalIngestRateLimitFilter filter =
-            new GlobalIngestRateLimitFilter(
-                    new GlobalIngestRateLimitProperties(2, 60),
-                    timeMeter,
-                    new IngestRejectionMetrics(new SimpleMeterRegistry()));
+                new GlobalIngestRateLimitFilter(
+                        new GlobalIngestRateLimitProperties(2, 60),
+                        timeMeter,
+                        new IngestRejectionMetrics(new SimpleMeterRegistry()));
 
         AtomicInteger downstreamCalls = new AtomicInteger();
 
@@ -57,10 +57,10 @@ class GlobalIngestRateLimitFilterTests {
 
         ManualTimeMeter timeMeter = new ManualTimeMeter();
         GlobalIngestRateLimitFilter filter =
-            new GlobalIngestRateLimitFilter(
-                    new GlobalIngestRateLimitProperties(1, 20),
-                    timeMeter,
-                    new IngestRejectionMetrics(new SimpleMeterRegistry()));
+                new GlobalIngestRateLimitFilter(
+                        new GlobalIngestRateLimitProperties(1, 20),
+                        timeMeter,
+                        new IngestRejectionMetrics(new SimpleMeterRegistry()));
 
         AtomicInteger downstreamCalls = new AtomicInteger();
 
@@ -105,10 +105,10 @@ class GlobalIngestRateLimitFilterTests {
     void rejectedRequestDoesNotReadBodyOrContentLength() throws Exception {
         ManualTimeMeter timeMeter = new ManualTimeMeter();
         GlobalIngestRateLimitFilter filter =
-        new GlobalIngestRateLimitFilter(
-                new GlobalIngestRateLimitProperties(1, 60),
-                timeMeter,
-                new IngestRejectionMetrics(new SimpleMeterRegistry()));
+                new GlobalIngestRateLimitFilter(
+                        new GlobalIngestRateLimitProperties(1, 60),
+                        timeMeter,
+                        new IngestRejectionMetrics(new SimpleMeterRegistry()));
 
         AtomicInteger downstreamCalls = new AtomicInteger();
 
@@ -155,10 +155,10 @@ class GlobalIngestRateLimitFilterTests {
 
         ManualTimeMeter timeMeter = new ManualTimeMeter();
         GlobalIngestRateLimitFilter filter =
-            new GlobalIngestRateLimitFilter(
-                    new GlobalIngestRateLimitProperties(capacity, 60),
-                    timeMeter,
-                    new IngestRejectionMetrics(new SimpleMeterRegistry()));
+                new GlobalIngestRateLimitFilter(
+                        new GlobalIngestRateLimitProperties(capacity, 60),
+                        timeMeter,
+                        new IngestRejectionMetrics(new SimpleMeterRegistry()));
 
         AtomicInteger downstreamCalls = new AtomicInteger();
 
