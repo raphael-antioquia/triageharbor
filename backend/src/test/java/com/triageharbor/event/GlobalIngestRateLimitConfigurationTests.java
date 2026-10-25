@@ -3,6 +3,7 @@ package com.triageharbor.event;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.github.bucket4j.TimeMeter;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -20,6 +21,10 @@ class GlobalIngestRateLimitConfigurationTests {
 
     private final ApplicationContextRunner unconfiguredRunner =
             new ApplicationContextRunner()
+                    .withBean(
+                            IngestRejectionMetrics.class,
+                            () -> new IngestRejectionMetrics(
+                                    new SimpleMeterRegistry()))
                     .withUserConfiguration(
                             GlobalIngestRateLimitConfiguration.class,
                             ValidationAutoConfiguration.class);

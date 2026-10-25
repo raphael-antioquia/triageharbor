@@ -4,6 +4,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.triageharbor.support.PostgresTestConfiguration;
 import io.github.bucket4j.TimeMeter;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Meter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -13,6 +16,7 @@ import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -53,6 +57,14 @@ class PerProjectIngestRateLimitHttpTests {
     @Autowired
     private AdjustableTimeMeter timeMeter;
 
+    @Autowired
+    private MeterRegistry meterRegistry;
+
+    @BeforeEach
+    void refillBuckets() {
+        timeMeter.advance(Duration.ofMinutes(5));
+    }
+
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
@@ -66,16 +78,23 @@ class PerProjectIngestRateLimitHttpTests {
         ProjectCredential a = insertProject("Project A");
         ProjectCredential b = insertProject("Project B");
 
+        double initialGlobalRejections = rejectionCount("global", "none");
+
         String canary = "CANARY_PROJECT_LIMIT_6f8";
         String body = validBody("password=" + canary);
 
         assertThat(post(a.ingestKey().toString(), body).statusCode())
                 .isEqualTo(202);
 
+        assertThat(rejectionCount("project", a.projectId().toString()))
+                .isZero();
+
         HttpResponse<String> rejected =
                 post(a.ingestKey().toString(), body);
 
         assertThat(rejected.statusCode()).isEqualTo(429);
+        assertThat(rejectionCount("project", a.projectId().toString()))
+                .isEqualTo(1.0);
         assertThat(rejected.body()).isEmpty();
         assertThat(rejected.headers().firstValue("Retry-After"))
                 .hasValue("3");
@@ -86,11 +105,32 @@ class PerProjectIngestRateLimitHttpTests {
         assertThat(post(b.ingestKey().toString(), validBody("B event"))
                         .statusCode())
                 .isEqualTo(202);
+        assertThat(rejectionCount("project", b.projectId().toString()))
+                .isZero();
 
+        assertThat(rejectionCount("global", "none"))
+                .isEqualTo(initialGlobalRejections);
         assertThat(count("incidents", a.projectId())).isEqualTo(1L);
         assertThat(count("events", a.projectId())).isEqualTo(1L);
         assertThat(count("incidents", b.projectId())).isEqualTo(1L);
         assertThat(count("events", b.projectId())).isEqualTo(1L);
+
+        meterRegistry.find(IngestRejectionMetrics.NAME)
+        .meters()
+        .forEach(meter -> {
+            Meter.Id id = meter.getId();
+
+            assertThat(id.getTag("reason"))
+                    .isIn("global", "project");
+
+            assertThat(id.getTag("project_id"))
+                    .isNotNull();
+
+            assertThat(id.toString())
+                    .doesNotContain(canary)
+                    .doesNotContain(a.ingestKey().toString())
+                    .doesNotContain(b.ingestKey().toString());
+        });
 
         assertThat(output.getAll())
                 .doesNotContain(canary)
@@ -124,11 +164,16 @@ class PerProjectIngestRateLimitHttpTests {
                         validBody("First valid event")).statusCode())
                 .isEqualTo(202);
 
-        assertThat(post(
-                        project.ingestKey().toString(),
-                        validBody("Second valid event")).statusCode())
-                .isEqualTo(429);
+        // Invalid requests and successful admission must not count as rejections.
+        assertThat(rejectionCount("project", project.projectId().toString()))
+                .isZero();
+                assertThat(post(
+                                project.ingestKey().toString(),
+                                validBody("Second valid event")).statusCode())
+                        .isEqualTo(429);
 
+        assertThat(rejectionCount("project", project.projectId().toString()))
+                .isEqualTo(1.0);
         assertThat(count("events", project.projectId())).isEqualTo(1L);
         assertThat(count("incidents", project.projectId())).isEqualTo(1L);
     }
@@ -161,6 +206,17 @@ class PerProjectIngestRateLimitHttpTests {
 
         assertThat(count("events", project.projectId())).isEqualTo(2L);
         assertThat(count("incidents", project.projectId())).isEqualTo(1L);
+    }
+
+    private double rejectionCount(String reason, String projectId) {
+        Counter counter =
+                meterRegistry.find(IngestRejectionMetrics.NAME)
+                        .tags(
+                                "reason", reason,
+                                "project_id", projectId)
+                        .counter();
+
+        return counter == null ? 0.0 : counter.count();
     }
 
     private HttpResponse<String> post(String ingestKey, String body)

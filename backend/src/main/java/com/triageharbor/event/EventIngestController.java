@@ -29,14 +29,18 @@ final class EventIngestController {
     private final IngestCredentialResolver ingestCredentialResolver;
     private final PerProjectIngestRateLimiter perProjectIngestRateLimiter;
     private final EventIngestService eventIngestService;
+    private final IngestRejectionMetrics rejectionMetrics;
 
     EventIngestController(
             IngestCredentialResolver ingestCredentialResolver,
             PerProjectIngestRateLimiter perProjectIngestRateLimiter,
-            EventIngestService eventIngestService) {
+            EventIngestService eventIngestService,
+            IngestRejectionMetrics rejectionMetrics) {
+
         this.ingestCredentialResolver = ingestCredentialResolver;
         this.perProjectIngestRateLimiter = perProjectIngestRateLimiter;
         this.eventIngestService = eventIngestService;
+        this.rejectionMetrics = rejectionMetrics;
     }
 
     @PostMapping(path = "/events", consumes = MediaType.APPLICATION_JSON_VALUE)
@@ -61,8 +65,9 @@ final class EventIngestController {
         ConsumptionProbe probe = perProjectIngestRateLimiter.tryConsume(project);
 
         if (!probe.isConsumed()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                    .header(
+            rejectionMetrics.recordProject(project);
+
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS).header(
                             HttpHeaders.RETRY_AFTER,
                             Long.toString(IngestRetryAfter.seconds(probe)))
                     .build();

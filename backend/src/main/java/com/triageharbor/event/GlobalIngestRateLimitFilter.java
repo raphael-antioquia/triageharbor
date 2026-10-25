@@ -16,10 +16,14 @@ import org.springframework.web.filter.OncePerRequestFilter;
 final class GlobalIngestRateLimitFilter extends OncePerRequestFilter {
 
     private final Bucket bucket;
+    private final IngestRejectionMetrics rejectionMetrics;
 
     GlobalIngestRateLimitFilter(
             GlobalIngestRateLimitProperties properties,
-            TimeMeter timeMeter) {
+            TimeMeter timeMeter,
+            IngestRejectionMetrics rejectionMetrics) {
+
+        this.rejectionMetrics = rejectionMetrics;
 
         this.bucket =
                 Bucket.builder()
@@ -46,6 +50,8 @@ final class GlobalIngestRateLimitFilter extends OncePerRequestFilter {
             filterChain.doFilter(request, response);
             return;
         }
+
+        rejectionMetrics.recordGlobal();
 
         response.setStatus(HttpStatus.TOO_MANY_REQUESTS.value());
         response.setHeader(

@@ -7,6 +7,8 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.triageharbor.support.PostgresTestConfiguration;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -15,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.system.CapturedOutput;
 import org.springframework.boot.test.system.OutputCaptureExtension;
@@ -40,6 +43,9 @@ class EventIngestFailureHandlerTests {
 
     @MockitoBean
     private EventIngestService eventIngestService;
+
+    @Autowired
+    private MeterRegistry meterRegistry;
 
     @Test
     void resolverDatabaseFailureReturns500(CapturedOutput output)
@@ -70,8 +76,10 @@ class EventIngestFailureHandlerTests {
         UUID ingestKey = UUID.randomUUID();
         String canary = "CANARY_WRITER_DB_84c2";
 
+        UUID projectId = UUID.randomUUID();
+
         when(ingestCredentialResolver.resolve(ingestKey))
-                .thenReturn(new AuthenticatedProject(UUID.randomUUID()));
+                .thenReturn(new AuthenticatedProject(projectId));
 
         doThrow(new DataIntegrityViolationException(
                         "Database write failed: " + canary))
@@ -79,9 +87,13 @@ class EventIngestFailureHandlerTests {
                 .ingest(any(AuthenticatedProject.class),
                         any(EventIngestRequest.class));
 
+        double before = projectRejectionCount(projectId);
+
         HttpResponse<String> response = postEvents(ingestKey);
 
         assertThat(response.statusCode()).isEqualTo(500);
+        assertThat(projectRejectionCount(projectId))
+                .isEqualTo(before);
         assertThat(response.body()).isEmpty();
 
         assertThat(output.getAll())
@@ -126,6 +138,17 @@ class EventIngestFailureHandlerTests {
                 .doesNotContain(messageCanary)
                 .doesNotContain(causeCanary)
                 .doesNotContain(ingestKey.toString());
+    }
+
+    private double projectRejectionCount(UUID projectId) {
+        Counter counter =
+                meterRegistry.find(IngestRejectionMetrics.NAME)
+                        .tags(
+                                "reason", "project",
+                                "project_id", projectId.toString())
+                        .counter();
+
+        return counter == null ? 0.0 : counter.count();
     }
 
     private HttpResponse<String> postEvents(UUID ingestKey)

@@ -22,12 +22,15 @@ class GlobalIngestRateLimitConfiguration {
     FilterRegistrationBean<GlobalIngestRateLimitFilter>
             globalIngestRateLimitFilter(
                     GlobalIngestRateLimitProperties properties,
-                    TimeMeter ingestTimeMeter) {
+                    TimeMeter ingestTimeMeter,
+                    IngestRejectionMetrics rejectionMetrics) {
 
         FilterRegistrationBean<GlobalIngestRateLimitFilter> registration =
                 new FilterRegistrationBean<>(
                         new GlobalIngestRateLimitFilter(
-                                properties, ingestTimeMeter));
+                                properties,
+                                ingestTimeMeter,
+                                rejectionMetrics));
 
         registration.addUrlPatterns("/events");
         registration.setOrder(GLOBAL_FILTER_ORDER);
