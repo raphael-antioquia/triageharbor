@@ -273,7 +273,7 @@ class EventIngestServiceTests {
                 ingestCredentialResolver.resolve(project.ingestKey());
 
         String fingerprint =
-                EventFingerprintV1.compute(
+                EventFingerprintV2.compute(
                         "java.lang.IllegalStateException",
                         "Something failed");
 
@@ -292,7 +292,7 @@ class EventIngestServiceTests {
                 """,
                 project.projectId(),
                 fingerprint,
-                EventFingerprintV1.VERSION,
+                EventFingerprintV2.VERSION,
                 "Original title snapshot",
                 RECEIVED_AT.atOffset(ZoneOffset.UTC),
                 RECEIVED_AT.atOffset(ZoneOffset.UTC));

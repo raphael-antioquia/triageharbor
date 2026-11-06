@@ -29,7 +29,7 @@ public class EventIngestService {
         Instant receivedAt = clock.instant();
 
         String fingerprint =
-                EventFingerprintV1.compute(
+                EventFingerprintV2.compute(
                         redactedEvent.exceptionType(),
                         redactedEvent.message());
 
@@ -72,7 +72,7 @@ public class EventIngestService {
                         UUID.class,
                         projectId,
                         fingerprint,
-                        EventFingerprintV1.VERSION,
+                        EventFingerprintV2.VERSION,
                         title,
                         receivedAtUtc,
                         receivedAtUtc);

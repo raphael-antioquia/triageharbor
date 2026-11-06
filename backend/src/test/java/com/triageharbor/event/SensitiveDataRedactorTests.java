@@ -5,14 +5,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertTimeout;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 
 /**
- * Fingerprint-v1 redaction golden vectors. A change in scrubbed fingerprint inputs
+ * Fingerprint-v2 redaction golden vectors. A change in scrubbed fingerprint inputs
  * requires fingerprint-version review; do not simply update the expected strings.
  */
 class SensitiveDataRedactorTests {
+
+    private static final String GOLDEN_INGEST_TOKEN =
+            "th_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
 
     @Test
     void goldenVectorsPinOrderAndSecretRemoval() {
@@ -47,7 +51,62 @@ class SensitiveDataRedactorTests {
                                 "URL inside sensitive assignment",
                                 "token=postgres://user:CANARY_URL_5d21e0@db/x",
                                 "token=[REDACTED]",
-                                "CANARY_URL_5d21e0"));
+                                "CANARY_URL_5d21e0"),
+                        new Golden(
+                                "standalone ingest credential",
+                                "failure reported " + GOLDEN_INGEST_TOKEN,
+                                "failure reported [REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "ingest credential assignment",
+                                "ingestKey=" + GOLDEN_INGEST_TOKEN,
+                                "ingestKey=[REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "ingest credential header",
+                                "X-TriageHarbor-Ingest-Key: " + GOLDEN_INGEST_TOKEN,
+                                "X-TriageHarbor-Ingest-Key: [REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "32-character credential minimum",
+                                "th_" + "A".repeat(32),
+                                "[REDACTED]",
+                                "A".repeat(32)),
+                        new Golden(
+                                "benign assignment containing credential",
+                                "reference=" + GOLDEN_INGEST_TOKEN,
+                                "reference=[REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "right-glued suffix is consumed",
+                                "context=" + GOLDEN_INGEST_TOKEN + "suffix",
+                                "context=[REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "uppercase at last window position",
+                                "th_" + "a".repeat(42) + "G",
+                                "[REDACTED]",
+                                "a".repeat(42) + "G"),
+                        new Golden(
+                                "left-glued credential",
+                                "Bearer" + GOLDEN_INGEST_TOKEN,
+                                "Bearer[REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "JSON string field",
+                                "{\"note\":\"" + GOLDEN_INGEST_TOKEN + "\"}",
+                                "{\"note\":\"[REDACTED]\"}",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "URL query parameter",
+                                "https://hooks.example/x?ref=" + GOLDEN_INGEST_TOKEN,
+                                "https://hooks.example/x?ref=[REDACTED]",
+                                GOLDEN_INGEST_TOKEN),
+                        new Golden(
+                                "left-glued detection accepts identifier false positive",
+                                "test_health_CheckFailsWhenPrimaryReplicaIsDown",
+                                "test_heal[REDACTED]",
+                                "CheckFailsWhenPrimaryReplicaIsDown"));
 
         for (Golden vector : vectors) {
             String sanitized = SensitiveDataRedactor.redact(vector.raw());
@@ -122,7 +181,10 @@ class SensitiveDataRedactorTests {
                         "private.key",
                         "sessionId",
                         "sessionid",
-                        "credentials")) {
+                        "credentials",
+                        "ingestKey",
+                        "ingest_key",
+                        "X-TriageHarbor-Ingest-Key")) {
             assertThat(SensitiveDataRedactor.redact(key + "=synthetic"))
                     .as(key)
                     .isEqualTo(key + "=[REDACTED]");
@@ -131,7 +193,16 @@ class SensitiveDataRedactorTests {
 
     @Test
     void benignIdentifiersDoNotRedact() {
-        for (String key : List.of("key", "cache_key", "tokenization", "oauth", "apiName")) {
+        for (String key :
+                List.of(
+                        "key",
+                        "cache_key",
+                        "tokenization",
+                        "oauth",
+                        "apiName",
+                        "ingest",
+                        "ingestId",
+                        "keyIngest")) {
             assertThat(SensitiveDataRedactor.redact(key + "=synthetic"))
                     .as(key)
                     .isEqualTo(key + "=synthetic");
@@ -252,6 +323,82 @@ class SensitiveDataRedactorTests {
                     assertThat(SensitiveDataRedactor.redact(jwt)).isEqualTo("[REDACTED]");
                     assertThat(SensitiveDataRedactor.redact(longQuoted))
                             .isEqualTo("password=\"[REDACTED]\"");
+                });
+    }
+
+    @Test
+    void credentialHeuristicKnownNearMissesArePinned() {
+        String tooShort = "th_" + "A".repeat(31);
+        String lowercaseOnly = "th_" + "a".repeat(42) + "g";
+        String uppercaseOutsideWindow = "th_" + "a".repeat(43) + "G";
+
+        for (String input :
+                List.of(tooShort, lowercaseOnly, uppercaseOutsideWindow)) {
+            assertThat(SensitiveDataRedactor.redact(input))
+                    .as(input)
+                    .isEqualTo(input);
+        }
+    }
+
+    @Test
+    void repeatedCredentialNearMissesRemainBounded() {
+        for (String fragment : List.of("th_th_", "th_ath_a")) {
+            String input =
+                    fragment.repeat(
+                            EventRequestSizeFilter.MAX_REQUEST_BYTES
+                                    / fragment.length());
+
+            assertTimeout(
+                    Duration.ofSeconds(2),
+                    () -> assertThat(SensitiveDataRedactor.redact(input))
+                            .as(fragment)
+                            .isEqualTo(input));
+        }
+    }
+
+    @Test
+    void fullEventRedactionWithAdversarialFieldsRemainsBounded() {
+        String token =
+                "th_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+        String exceptionType = "SyntheticError " + token;
+        String message =
+                "th_th_".repeat(10_000) + " password=CANARY_MSG_7f3a91";
+        String stackTrace =
+                "th_ath_a".repeat(10_000)
+                        + " postgres://user:CANARY_URL_5d21e0@db/x";
+
+        // Conservative allowance for JSON property names and punctuation.
+        assertThat(
+                        exceptionType.length()
+                                + message.length()
+                                + stackTrace.length()
+                                + 512)
+                .isLessThan(EventRequestSizeFilter.MAX_REQUEST_BYTES);
+
+        assertTimeout(
+                Duration.ofSeconds(2),
+                () -> {
+                    RedactedEvent event =
+                            RedactedEvent.from(
+                                    new EventIngestRequest(
+                                            Instant.parse("2026-01-01T10:00:00Z"),
+                                            exceptionType,
+                                            message,
+                                            stackTrace));
+
+                    assertThat(event.exceptionType())
+                            .isEqualTo("SyntheticError [REDACTED]");
+
+                    assertThat(event.message())
+                            .isEqualTo(
+                                    "th_th_".repeat(10_000)
+                                            + " password=[REDACTED]");
+
+                    assertThat(event.stackTrace())
+                            .isEqualTo(
+                                    "th_ath_a".repeat(10_000)
+                                            + " postgres://user:[REDACTED]@db/x");
                 });
     }
 
