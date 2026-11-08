@@ -3,6 +3,7 @@ package com.triageharbor.event;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.time.Clock;
 import java.time.Instant;
@@ -52,7 +53,7 @@ class EventIngestServiceTests {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -350,11 +351,9 @@ class EventIngestServiceTests {
                 projectId,
                 name);
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         return new ProjectCredential(projectId, ingestKey);
     }
@@ -380,7 +379,9 @@ class EventIngestServiceTests {
         return count;
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(
+            UUID projectId,
+            String ingestKey) {}
 
     @TestConfiguration(proxyBeanMethods = false)
     static class TestClockConfiguration {

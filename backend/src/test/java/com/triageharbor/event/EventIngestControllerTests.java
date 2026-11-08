@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -34,7 +35,7 @@ class EventIngestControllerTests {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -43,7 +44,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "2026-09-05T20:00:00Z",
@@ -57,6 +58,102 @@ class EventIngestControllerTests {
         assertThat(response.body()).isEmpty();
         assertThat(rowCount("incidents")).isEqualTo(1L);
         assertThat(rowCount("events")).isEqualTo(1L);
+    }
+
+    @Test
+    void revokedKeyIsRejectedWhileSiblingKeyKeepsWorking() throws Exception {
+        ProjectCredential project = insertProject("Project A");
+
+        String replacementKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, project.projectId());
+
+        assertThat(replacementKey).isNotEqualTo(project.ingestKey());
+
+        // Both credentials are valid during the rotation overlap.
+        assertThat(postEvents(project.ingestKey(), validBody()).statusCode())
+                .isEqualTo(202);
+
+        assertThat(postEvents(replacementKey, validBody()).statusCode())
+                .isEqualTo(202);
+
+        assertThat(rowCount("events")).isEqualTo(2L);
+
+        // Revoke only the original credential.
+        int revoked =
+                jdbcTemplate.update(
+                        """
+                        UPDATE project_ingest_credentials
+                        SET revoked_at = now()
+                        WHERE key_hash = sha256(convert_to(?, 'UTF8'))
+                          AND revoked_at IS NULL
+                        """,
+                        project.ingestKey());
+
+        assertThat(revoked).isEqualTo(1);
+
+        HttpResponse<String> rejected =
+                postEvents(project.ingestKey(), validBody());
+
+        assertThat(rejected.statusCode()).isEqualTo(401);
+        assertThat(rejected.body()).isEmpty();
+
+        // Rejected requests must not persist another occurrence.
+        assertThat(rowCount("events")).isEqualTo(2L);
+
+        // The replacement credential still works after revocation.
+        assertThat(postEvents(replacementKey, validBody()).statusCode())
+                .isEqualTo(202);
+
+        assertThat(rowCount("events")).isEqualTo(3L);
+        assertThat(rowCount("incidents")).isEqualTo(1L);
+    }
+
+    @Test
+    void duplicateIngestHeadersFailClosed() throws Exception {
+        ProjectCredential project = insertProject("Project A");
+        String unknownKey = "th_" + "A".repeat(43);
+
+        HttpResponse<String> validFirst =
+                postEventsWithDuplicateKeys(
+                        project.ingestKey(), unknownKey);
+
+        HttpResponse<String> unknownFirst =
+                postEventsWithDuplicateKeys(
+                        unknownKey, project.ingestKey());
+
+        HttpResponse<String> sameKeyTwice =
+                postEventsWithDuplicateKeys(
+                        project.ingestKey(), project.ingestKey());
+
+        HttpResponse<String> commaJoined =
+                postEvents(
+                        project.ingestKey() + "," + unknownKey,
+                        validBody());
+
+        assertThat(validFirst.statusCode())
+                .as("valid-first")
+                .isEqualTo(401);
+
+        assertThat(unknownFirst.statusCode())
+                .as("unknown-first")
+                .isEqualTo(401);
+
+        assertThat(sameKeyTwice.statusCode())
+                .as("same-key-twice")
+                .isEqualTo(401);
+
+        assertThat(commaJoined.statusCode())
+                .as("comma-joined")
+                .isEqualTo(401);
+
+        assertThat(validFirst.body()).isEmpty();
+        assertThat(unknownFirst.body()).isEmpty();
+        assertThat(sameKeyTwice.body()).isEmpty();
+        assertThat(commaJoined.body()).isEmpty();
+
+        assertThat(rowCount("events")).isZero();
+        assertThat(rowCount("incidents")).isZero();
     }
 
     @Test
@@ -89,7 +186,7 @@ class EventIngestControllerTests {
     void unknownIngestKeyReturnsUnauthorized() throws Exception {
         HttpResponse<String> response =
                 postEvents(
-                        UUID.randomUUID().toString(),
+                        "th_" + "A".repeat(43),
                         validBody());
 
         assertThat(response.statusCode()).isEqualTo(401);
@@ -120,7 +217,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "message": "Something failed"
@@ -129,7 +226,7 @@ class EventIngestControllerTests {
 
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
-                .doesNotContain(project.ingestKey().toString())
+                .doesNotContain(project.ingestKey())
                 .doesNotContain("Something failed");
 
         assertThat(rowCount("incidents")).isZero();
@@ -142,7 +239,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "2026-09-05T20:00:00Z"
@@ -151,7 +248,7 @@ class EventIngestControllerTests {
 
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
 
         assertThat(rowCount("incidents")).isZero();
         assertThat(rowCount("events")).isZero();
@@ -163,7 +260,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "2026-09-05T20:00:00Z",
@@ -172,7 +269,7 @@ class EventIngestControllerTests {
 
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
-                .doesNotContain(project.ingestKey().toString())
+                .doesNotContain(project.ingestKey())
                 .doesNotContain("Sensitive synthetic marker");
 
         assertThat(rowCount("incidents")).isZero();
@@ -198,7 +295,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        projectA.ingestKey().toString(),
+                        projectA.ingestKey(),
                         """
                         {
                           "projectId": "%s",
@@ -245,7 +342,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         body);
 
         assertThat(response.statusCode()).isEqualTo(413);
@@ -263,7 +360,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "2026-09-05T20:00:00Z",
@@ -274,7 +371,7 @@ class EventIngestControllerTests {
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
 
         assertThat(rowCount("incidents")).isZero();
         assertThat(rowCount("events")).isZero();
@@ -283,7 +380,7 @@ class EventIngestControllerTests {
                 .contains("Rejected unreadable POST /events request body")
                 .doesNotContain("DefaultHandlerExceptionResolver")
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
     }
 
     @Test
@@ -295,7 +392,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "CANARY_INVALID_INSTANT_47b9",
@@ -306,7 +403,7 @@ class EventIngestControllerTests {
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
 
         assertThat(rowCount("incidents")).isZero();
         assertThat(rowCount("events")).isZero();
@@ -315,7 +412,7 @@ class EventIngestControllerTests {
                 .contains("Rejected unreadable POST /events request body")
                 .doesNotContain("DefaultHandlerExceptionResolver")
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
     }
 
     @Test
@@ -327,7 +424,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "message": "password=CANARY_VALIDATION_MSG_81ad"
@@ -337,7 +434,7 @@ class EventIngestControllerTests {
         assertThat(response.statusCode()).isEqualTo(400);
         assertThat(response.body())
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
 
         assertThat(rowCount("incidents")).isZero();
         assertThat(rowCount("events")).isZero();
@@ -347,7 +444,7 @@ class EventIngestControllerTests {
                 .contains("MethodArgumentNotValidException")
                 .contains("occurredAt")
                 .doesNotContain(canary)
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
     }
 
     @Test
@@ -358,7 +455,7 @@ class EventIngestControllerTests {
 
         HttpResponse<String> response =
                 postEvents(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {
                           "occurredAt": "2026-09-05T20:00:00Z",
@@ -378,7 +475,37 @@ class EventIngestControllerTests {
                 .doesNotContain("CANARY_SUCCESS_TYPE_2e8f")
                 .doesNotContain("CANARY_SUCCESS_MSG_73c1")
                 .doesNotContain("CANARY_SUCCESS_TRACE_8b4e")
-                .doesNotContain(project.ingestKey().toString());
+                .doesNotContain(project.ingestKey());
+    }
+
+    private HttpResponse<String> postEventsWithDuplicateKeys(
+            String firstKey,
+            String secondKey)
+            throws Exception {
+
+        HttpRequest request =
+                HttpRequest.newBuilder()
+                        .uri(URI.create("http://localhost:" + port + "/events"))
+                        .header("Content-Type", "application/json")
+                        .header(
+                                EventIngestController.INGEST_KEY_HEADER,
+                                firstKey)
+                        .header(
+                                EventIngestController.INGEST_KEY_HEADER,
+                                secondKey)
+                        .POST(
+                                HttpRequest.BodyPublishers.ofString(
+                                        validBody(),
+                                        StandardCharsets.UTF_8))
+                        .build();
+
+        assertThat(request.headers().allValues(
+                        EventIngestController.INGEST_KEY_HEADER))
+                .containsExactly(firstKey, secondKey);
+
+        return HTTP_CLIENT.send(
+                request,
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
     }
 
     private HttpResponse<String> postEvents(
@@ -412,11 +539,9 @@ class EventIngestControllerTests {
                 projectId,
                 name);
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         return new ProjectCredential(projectId, ingestKey);
     }
@@ -439,5 +564,7 @@ class EventIngestControllerTests {
                 """;
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(
+            UUID projectId,
+            String ingestKey) {}
 }

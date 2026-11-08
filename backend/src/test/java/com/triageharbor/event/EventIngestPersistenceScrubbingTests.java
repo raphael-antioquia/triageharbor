@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -36,7 +37,7 @@ class EventIngestPersistenceScrubbingTests {
     void cleanUpAsAdmin() throws SQLException {
         try (Connection admin = adminConnection();
                 Statement statement = admin.createStatement()) {
-            statement.execute("TRUNCATE TABLE events, incidents, projects");
+            statement.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
         }
     }
 
@@ -370,19 +371,18 @@ class EventIngestPersistenceScrubbingTests {
                                 """
                                 INSERT INTO projects (id, name)
                                 VALUES (?, ?)
-                                RETURNING ingest_key
                                 """)) {
 
             statement.setObject(1, projectId);
             statement.setString(2, name);
 
-            try (ResultSet result = statement.executeQuery()) {
-                assertThat(result.next()).isTrue();
+            assertThat(statement.executeUpdate()).isEqualTo(1);
 
-                return new ProjectCredential(
-                        projectId,
-                        result.getObject("ingest_key", UUID.class));
-            }
+            String ingestKey =
+                    IngestCredentialFixtures.insertForProject(
+                            admin, projectId);
+
+            return new ProjectCredential(projectId, ingestKey);
         }
     }
 
@@ -393,5 +393,5 @@ class EventIngestPersistenceScrubbingTests {
                 postgresContainer.getPassword());
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(UUID projectId, String ingestKey) {}
 }

@@ -2,6 +2,7 @@ package com.triageharbor.incident;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -35,7 +36,7 @@ class IncidentReadControllerTests {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -292,7 +293,7 @@ class IncidentReadControllerTests {
         HttpResponse<String> withProjectBIngestKey =
                 getIncidents(
                         projectA.projectId(),
-                        projectB.ingestKey().toString());
+                        projectB.ingestKey());
 
         assertThat(withoutHeader.statusCode()).isEqualTo(200);
         assertThat(withProjectBIngestKey.statusCode()).isEqualTo(200);
@@ -347,11 +348,9 @@ class IncidentReadControllerTests {
                 projectId,
                 name);
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         return new ProjectCredential(projectId, ingestKey);
     }
@@ -410,5 +409,7 @@ class IncidentReadControllerTests {
         }
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(
+            UUID projectId,
+            String ingestKey) {}
 }

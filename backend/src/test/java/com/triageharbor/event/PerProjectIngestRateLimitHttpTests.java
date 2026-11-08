@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import io.github.bucket4j.TimeMeter;
 import io.micrometer.core.instrument.Counter;
@@ -67,7 +68,7 @@ class PerProjectIngestRateLimitHttpTests {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -83,14 +84,14 @@ class PerProjectIngestRateLimitHttpTests {
         String canary = "CANARY_PROJECT_LIMIT_6f8";
         String body = validBody("password=" + canary);
 
-        assertThat(post(a.ingestKey().toString(), body).statusCode())
+        assertThat(post(a.ingestKey(), body).statusCode())
                 .isEqualTo(202);
 
         assertThat(rejectionCount("project", a.projectId().toString()))
                 .isZero();
 
         HttpResponse<String> rejected =
-                post(a.ingestKey().toString(), body);
+                post(a.ingestKey(), body);
 
         assertThat(rejected.statusCode()).isEqualTo(429);
         assertThat(rejectionCount("project", a.projectId().toString()))
@@ -102,7 +103,7 @@ class PerProjectIngestRateLimitHttpTests {
                 .isEmpty();
 
         // A's exhausted quota must not consume B's first token.
-        assertThat(post(b.ingestKey().toString(), validBody("B event"))
+        assertThat(post(b.ingestKey(), validBody("B event"))
                         .statusCode())
                 .isEqualTo(202);
         assertThat(rejectionCount("project", b.projectId().toString()))
@@ -129,14 +130,55 @@ class PerProjectIngestRateLimitHttpTests {
 
                             assertThat(id.toString())
                                     .doesNotContain(canary)
-                                    .doesNotContain(a.ingestKey().toString())
-                                    .doesNotContain(b.ingestKey().toString());
+                                    .doesNotContain(a.ingestKey())
+                                    .doesNotContain(b.ingestKey());
                         });
 
         assertThat(output.getAll())
                 .doesNotContain(canary)
-                .doesNotContain(a.ingestKey().toString())
-                .doesNotContain(b.ingestKey().toString());
+                .doesNotContain(a.ingestKey())
+                .doesNotContain(b.ingestKey());
+    }
+
+    @Test
+    void twoCredentialsForSameProjectShareOneQuota() throws Exception {
+        ProjectCredential project = insertProject("Project A");
+
+        String secondKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, project.projectId());
+
+        assertThat(secondKey).isNotEqualTo(project.ingestKey());
+
+        String body = validBody("One shared incident");
+
+        assertThat(post(project.ingestKey(), body).statusCode())
+                .isEqualTo(202);
+
+        HttpResponse<String> limited = post(secondKey, body);
+
+        assertThat(limited.statusCode()).isEqualTo(429);
+        assertThat(limited.body()).isEmpty();
+        assertThat(limited.headers().firstValue("Retry-After"))
+                .hasValue("3");
+
+        assertThat(count("events", project.projectId()))
+                .isEqualTo(1L);
+
+        assertThat(rejectionCount(
+                        "project", project.projectId().toString()))
+                .isEqualTo(1.0);
+
+        timeMeter.advance(Duration.ofSeconds(3));
+
+        assertThat(post(secondKey, body).statusCode())
+                .isEqualTo(202);
+
+        assertThat(count("events", project.projectId()))
+                .isEqualTo(2L);
+
+        assertThat(count("incidents", project.projectId()))
+                .isEqualTo(1L);
     }
 
     @Test
@@ -144,24 +186,24 @@ class PerProjectIngestRateLimitHttpTests {
         ProjectCredential project = insertProject("Project A");
 
         assertThat(post(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         "{ not json").statusCode())
                 .isEqualTo(400);
 
         assertThat(post(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         """
                         {"message": "Missing occurredAt"}
                         """).statusCode())
                 .isEqualTo(400);
 
         assertThat(post(
-                        UUID.randomUUID().toString(),
+                        "th_" + "A".repeat(43),
                         validBody("Unknown key")).statusCode())
                 .isEqualTo(401);
 
         assertThat(post(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         validBody("First valid event")).statusCode())
                 .isEqualTo(202);
 
@@ -170,7 +212,7 @@ class PerProjectIngestRateLimitHttpTests {
                 .isZero();
 
         assertThat(post(
-                        project.ingestKey().toString(),
+                        project.ingestKey(),
                         validBody("Second valid event")).statusCode())
                 .isEqualTo(429);
 
@@ -183,7 +225,7 @@ class PerProjectIngestRateLimitHttpTests {
     @Test
     void retryAfterRoundsUpAndQuotaRefills() throws Exception {
         ProjectCredential project = insertProject("Project A");
-        String key = project.ingestKey().toString();
+        String key = project.ingestKey();
         String body = validBody("Repeatable failure");
 
         assertThat(post(key, body).statusCode()).isEqualTo(202);
@@ -250,11 +292,9 @@ class PerProjectIngestRateLimitHttpTests {
                 projectId,
                 name);
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         return new ProjectCredential(projectId, ingestKey);
     }
@@ -279,7 +319,9 @@ class PerProjectIngestRateLimitHttpTests {
                 .formatted(message);
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(
+            UUID projectId,
+            String ingestKey) {}
 
     @TestConfiguration(proxyBeanMethods = false)
     static class AdjustableTimeConfiguration {

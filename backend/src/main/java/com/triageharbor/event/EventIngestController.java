@@ -2,7 +2,6 @@ package com.triageharbor.event;
 
 import io.github.bucket4j.ConsumptionProbe;
 import jakarta.validation.Valid;
-import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.dao.DataAccessException;
@@ -48,16 +47,10 @@ final class EventIngestController {
             @RequestHeader(name = INGEST_KEY_HEADER, required = false) String rawIngestKey,
             @Valid @RequestBody EventIngestRequest request) {
 
-        UUID ingestKey = parseIngestKey(rawIngestKey);
-
-        if (ingestKey == null) {
-            return unauthorized();
-        }
-
         AuthenticatedProject project;
 
         try {
-            project = ingestCredentialResolver.resolve(ingestKey);
+            project = ingestCredentialResolver.resolve(rawIngestKey);
         } catch (UnknownIngestKeyException exception) {
             return unauthorized();
         }
@@ -95,18 +88,6 @@ final class EventIngestController {
                 exception.getClass().getSimpleName());
 
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
-    }
-
-    private static UUID parseIngestKey(String rawIngestKey) {
-        if (rawIngestKey == null) {
-            return null;
-        }
-
-        try {
-            return UUID.fromString(rawIngestKey);
-        } catch (IllegalArgumentException exception) {
-            return null;
-        }
     }
 
     private static ResponseEntity<Void> unauthorized() {

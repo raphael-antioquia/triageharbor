@@ -3,6 +3,7 @@ package com.triageharbor.event;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.sql.Connection;
 import java.time.Instant;
@@ -39,7 +40,7 @@ class EventIngestTransactionStartFailureTests {
     @AfterEach
     void cleanUp() {
         jdbcTemplate.execute(
-                "TRUNCATE TABLE events, incidents, projects");
+                "TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -51,11 +52,9 @@ class EventIngestTransactionStartFailureTests {
                 projectId,
                 "Pool exhaustion test");
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         // Resolve before occupying the pool's only connection.
         AuthenticatedProject project =

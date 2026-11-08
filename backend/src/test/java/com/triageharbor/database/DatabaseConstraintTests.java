@@ -25,7 +25,7 @@ class DatabaseConstraintTests {
 
     @AfterEach
     void cleanUp() {
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -314,59 +314,128 @@ class DatabaseConstraintTests {
     }
 
     @Test
-    void projectIngestKeyIsGenerated() {
+    void credentialHashMustBe32Bytes() {
         UUID projectId = insertProject("Test Project");
 
-        assertThat(ingestKeyOf(projectId)).isNotNull();
+        assertConstraintViolation(
+                "23514",
+                "project_ingest_credentials_hash_length",
+                () -> insertCredential(
+                        projectId,
+                        new byte[31],
+                        "th_abcdefgh"));
     }
 
     @Test
-    void eachProjectReceivesADistinctIngestKey() {
-        UUID keyA = ingestKeyOf(insertProject("Project A"));
-        UUID keyB = ingestKeyOf(insertProject("Project B"));
-
-        assertThat(keyA).isNotEqualTo(keyB);
-    }
-
-    @Test
-    void duplicateProjectIngestKeyIsRejected() {
+    void credentialHashMustBeUniqueAcrossProjects() {
         UUID projectA = insertProject("Project A");
-        UUID ingestKey = ingestKeyOf(projectA);
+        UUID projectB = insertProject("Project B");
+
+        byte[] hash = new byte[32];
+
+        insertCredential(projectA, hash, "th_abcdefgh");
 
         assertConstraintViolation(
                 "23505",
-                "projects_ingest_key_unique",
-                () ->
-                        jdbcTemplate.update(
-                                """
-                                INSERT INTO projects (id, name, ingest_key)
-                                VALUES (?, ?, ?)
-                                """,
-                                UUID.randomUUID(),
-                                "Project B",
-                                ingestKey));
+                "project_ingest_credentials_hash_unique",
+                () -> insertCredential(
+                        projectB,
+                        hash,
+                        "th_ijklmnop"));
     }
 
     @Test
-    void projectIngestKeyCannotBeNull() {
-        assertColumnViolation(
-                "23502",
-                "ingest_key",
-                () ->
-                        jdbcTemplate.update(
-                                """
-                                INSERT INTO projects (id, name, ingest_key)
-                                VALUES (?, ?, NULL)
-                                """,
-                                UUID.randomUUID(),
-                                "Test Project"));
+    void credentialPrefixMustMatchRequiredFormat() {
+        UUID projectId = insertProject("Test Project");
+
+        assertConstraintViolation(
+                "23514",
+                "project_ingest_credentials_prefix_format",
+                () -> insertCredential(
+                        projectId,
+                        new byte[32],
+                        "th_abcd!fgh"));
+
+        assertConstraintViolation(
+                "23514",
+                "project_ingest_credentials_prefix_format",
+                () -> insertCredential(
+                        projectId,
+                        new byte[32],
+                        "th_abc"));
     }
 
-    private UUID ingestKeyOf(UUID projectId) {
-        return jdbcTemplate.queryForObject(
-                "SELECT ingest_key FROM projects WHERE id = ?",
-                UUID.class,
-                projectId);
+    @Test
+    void credentialCannotReferenceNonexistentProject() {
+        assertConstraintViolation(
+                "23503",
+                "project_ingest_credentials_project_fk",
+                () -> insertCredential(
+                        UUID.randomUUID(),
+                        new byte[32],
+                        "th_abcdefgh"));
+    }
+
+    @Test
+    void projectDeletionIsRestrictedWhenCredentialExists() {
+        UUID projectId = insertProject("Test Project");
+
+        insertCredential(
+                projectId,
+                new byte[32],
+                "th_abcdefgh");
+
+        assertConstraintViolation(
+                "23503",
+                "project_ingest_credentials_project_fk",
+                () -> jdbcTemplate.update(
+                        "DELETE FROM projects WHERE id = ?",
+                        projectId));
+    }
+
+    @Test
+    void credentialHashCannotBeNull() {
+        UUID projectId = insertProject("Test Project");
+
+        assertColumnViolation(
+                "23502",
+                "key_hash",
+                () -> insertCredential(
+                        projectId,
+                        null,
+                        "th_abcdefgh"));
+    }
+
+    @Test
+    void credentialPrefixCannotBeNull() {
+        UUID projectId = insertProject("Test Project");
+
+        assertColumnViolation(
+                "23502",
+                "key_prefix",
+                () -> insertCredential(
+                        projectId,
+                        new byte[32],
+                        null));
+    }
+
+    private void insertCredential(
+            UUID projectId,
+            byte[] keyHash,
+            String keyPrefix) {
+
+        jdbcTemplate.update(
+                """
+                INSERT INTO project_ingest_credentials (
+                    project_id,
+                    key_hash,
+                    key_prefix
+                )
+                VALUES (?, ?, ?)
+                """,
+                projectId,
+                keyHash,
+                keyPrefix);
     }
 
     private UUID insertProject(String name) {

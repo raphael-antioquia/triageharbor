@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.PostgresTestConfiguration;
 import java.time.Duration;
 import java.time.Instant;
@@ -78,7 +79,7 @@ class EventIngestConcurrencyTests {
         if (!databaseCleanupSafe) {
             return;
         }
-        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, projects");
+        jdbcTemplate.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
     }
 
     @Test
@@ -427,11 +428,9 @@ class EventIngestConcurrencyTests {
                 projectId,
                 name);
 
-        UUID ingestKey =
-                jdbcTemplate.queryForObject(
-                        "SELECT ingest_key FROM projects WHERE id = ?",
-                        UUID.class,
-                        projectId);
+        String ingestKey =
+                IngestCredentialFixtures.insertForProject(
+                        jdbcTemplate, projectId);
 
         return new ProjectCredential(projectId, ingestKey);
     }
@@ -480,5 +479,5 @@ class EventIngestConcurrencyTests {
 
     private record ProjectCredential(
             UUID projectId,
-            UUID ingestKey) {}
+            String ingestKey) {}
 }
