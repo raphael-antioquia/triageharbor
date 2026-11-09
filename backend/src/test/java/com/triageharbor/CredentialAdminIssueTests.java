@@ -1105,6 +1105,134 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    void stderrFailureAfterCommitStillDeliversToken() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "late-stderr-failure-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        // Unlike Test 5, do not prime this failing stream.
+        OutputStream brokenStderr = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stderr failure");
+            }
+        };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    brokenStderr, true, StandardCharsets.UTF_8)) {
+
+                assertThat(err.checkError()).isFalse();
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+
+                assertThat(err.checkError()).isTrue();
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+
+            byte[] storedHash;
+
+            // Outcome first: the credential really committed.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT key_hash
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    storedHash = rows.getBytes(1);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            // The token must still be delivered exactly once.
+            String output = stdout.toString(StandardCharsets.UTF_8);
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output).isEqualTo(token + System.lineSeparator());
+
+            assertThat(storedHash)
+                    .containsExactly(
+                            MessageDigest.getInstance("SHA-256")
+                                    .digest(token.getBytes(
+                                            StandardCharsets.UTF_8)));
+
+            // Confirm COMMIT happened and rollback was never attempted.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(rollbackAttempted.get()).isFalse();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
