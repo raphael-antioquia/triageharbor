@@ -1,14 +1,21 @@
 package com.triageharbor;
 
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.Map;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -32,6 +39,8 @@ public final class CredentialAdmin {
             DateTimeFormatter.ofPattern("uuuu-MM-dd'T'HH:mm:ss.SSSSSS'Z'")
                     .withZone(ZoneOffset.UTC);
 
+    private static final SecureRandom TOKEN_RANDOM = new SecureRandom();
+
     private CredentialAdmin() {}
 
     public static void main(String[] args) {
@@ -48,11 +57,29 @@ public final class CredentialAdmin {
                 run(args, System.getenv(), commandOut, System.err));
     }
 
+    @FunctionalInterface
+    interface ConnectionOpener {
+        Connection open(
+                String jdbcUrl,
+                String username,
+                String password) throws SQLException;
+    }
+
     static int run(
             String[] args,
             Map<String, String> env,
             PrintStream out,
             PrintStream err) {
+
+        return run(args, env, out, err, DriverManager::getConnection);
+    }
+
+    static int run(
+            String[] args,
+            Map<String, String> env,
+            PrintStream out,
+            PrintStream err,
+            ConnectionOpener connectionOpener) {
 
         ParsedCommand command;
 
@@ -115,7 +142,16 @@ public final class CredentialAdmin {
             }
         }
 
-        // Issue and revoke are not implemented yet.
+        if ("issue".equals(command.verb())) {
+            return issueCredential(
+                    config,
+                    command.projectId(),
+                    out,
+                    err,
+                    connectionOpener);
+        }
+
+        // Revoke remains unimplemented until B3.
         return report(
                 err,
                 1,
@@ -202,6 +238,276 @@ public final class CredentialAdmin {
             }
 
             throw exception;
+        }
+    }
+
+    private enum IssueOutcome {
+        NOT_COMMITTED,
+        COMMIT_UNCERTAIN,
+        COMMITTED
+    }
+
+    private static int issueCredential(
+            DatabaseConfig config,
+            UUID projectId,
+            PrintStream out,
+            PrintStream err,
+            ConnectionOpener connectionOpener) {
+
+        IssueOutcome outcome = IssueOutcome.NOT_COMMITTED;
+        UUID credentialId = null;
+        String metadata = null;
+        Exception failure = null;
+
+        // Generate the secret before opening a database transaction.
+        String token;
+        byte[] keyHash;
+
+        try {
+            byte[] randomBytes = new byte[32];
+            TOKEN_RANDOM.nextBytes(randomBytes);
+
+            token = "th_"
+                    + Base64.getUrlEncoder()
+                            .withoutPadding()
+                            .encodeToString(randomBytes);
+
+            // Best effort; the token String itself cannot be erased.
+            Arrays.fill(randomBytes, (byte) 0);
+
+            keyHash = MessageDigest.getInstance("SHA-256")
+                    .digest(token.getBytes(StandardCharsets.UTF_8));
+
+        } catch (NoSuchAlgorithmException | RuntimeException exception) {
+            return report(
+                    err,
+                    1,
+                    "Credential generation failed. No credential was issued.",
+                    false);
+        }
+
+        // Connection acquisition is separate from transactional work.
+        // If opening fails, no SQL has executed.
+        Connection connection;
+
+        try {
+            connection = connectionOpener.open(
+                    config.jdbcUrl,
+                    config.username,
+                    config.password);
+        } catch (SQLException | RuntimeException exception) {
+            return report(
+                    err,
+                    1,
+                    "Database connection failed (SQLState "
+                            + sqlState(exception)
+                            + "). No credential was issued.",
+                    false);
+        }
+
+        try {
+            // This must happen before executing any SQL.
+            connection.setAutoCommit(false);
+
+            try (Statement timeout = connection.createStatement()) {
+                timeout.execute("SET LOCAL lock_timeout = '5s'");
+            }
+
+            String projectName;
+
+            try (PreparedStatement lock =
+                    connection.prepareStatement(
+                            """
+                            SELECT name
+                            FROM projects
+                            WHERE id = ?
+                            FOR NO KEY UPDATE
+                            """)) {
+
+                lock.setObject(1, projectId);
+
+                try (ResultSet rows = lock.executeQuery()) {
+                    if (!rows.next()) {
+                        throw new MissingProjectException();
+                    }
+
+                    projectName = rows.getString(1);
+                }
+            }
+
+            try (PreparedStatement insert =
+                    connection.prepareStatement(
+                            """
+                            INSERT INTO project_ingest_credentials (
+                                project_id,
+                                key_hash,
+                                key_prefix
+                            )
+                            VALUES (?, ?, ?)
+                            RETURNING id
+                            """)) {
+
+                insert.setObject(1, projectId);
+                insert.setBytes(2, keyHash);
+                insert.setString(3, token.substring(0, 11));
+
+                try (ResultSet rows = insert.executeQuery()) {
+                    if (!rows.next()) {
+                        throw new SQLException(
+                                "Credential INSERT returned no row",
+                                "XX000");
+                    }
+
+                    credentialId = rows.getObject(1, UUID.class);
+
+                    if (credentialId == null || rows.next()) {
+                        throw new SQLException(
+                                "Unexpected credential INSERT result",
+                                "XX000");
+                    }
+                }
+            }
+
+            // Prepare safe metadata before attempting COMMIT.
+            metadata = "Credential " + credentialId
+                    + " committed for project " + projectId
+                    + " (name=" + escapeTsv(projectName) + ").";
+
+            // Do not commit if stderr is already known to be unusable.
+            if (err.checkError()) {
+                throw new IllegalStateException(
+                        "Diagnostic stream already unavailable");
+            }
+
+            // A COMMIT exception always produces an uncertain outcome.
+            outcome = IssueOutcome.COMMIT_UNCERTAIN;
+
+            connection.commit();
+
+            outcome = IssueOutcome.COMMITTED;
+
+        } catch (SQLException | RuntimeException exception) {
+            failure = exception;
+        }
+
+        if (outcome != IssueOutcome.COMMITTED) {
+            // Rollback is attempted for both definitely uncommitted
+            // and uncertain outcomes. Never replace the original error.
+            try {
+                connection.rollback();
+            } catch (SQLException | RuntimeException rollbackFailure) {
+                if (failure != null) {
+                    failure.addSuppressed(rollbackFailure);
+                }
+            }
+
+            try {
+                connection.close();
+            } catch (SQLException | RuntimeException closeFailure) {
+                if (failure != null) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+
+            if (outcome == IssueOutcome.COMMIT_UNCERTAIN) {
+                return report(
+                        err,
+                        1,
+                        "Commit outcome uncertain for credential "
+                                + credentialId
+                                + " (SQLState " + sqlState(failure) + "). "
+                                + "Run list for project " + projectId
+                                + ". If credential " + credentialId
+                                + " is present, issue a replacement credential, "
+                                + "then revoke " + credentialId + ".",
+                        false);
+            }
+
+            if (failure instanceof MissingProjectException) {
+                return report(
+                        err,
+                        1,
+                        "Project not found. No credential was issued.",
+                        false);
+            }
+
+            return report(
+                    err,
+                    1,
+                    "Credential issuance failed (SQLState "
+                            + sqlState(failure)
+                            + "). No credential was issued.",
+                    false);
+        }
+
+        // COMMIT has been confirmed.
+        // Never attempt rollback after this point.
+
+        // Write metadata first, then attempt token output exactly once.
+        // Both happen before potentially slow connection cleanup.
+        boolean stderrOk = writeLine(err, metadata);
+        boolean stdoutOk = writeLine(out, token);
+
+        Throwable closeFailure = null;
+
+        try {
+            connection.close();
+        } catch (SQLException | RuntimeException exception) {
+            closeFailure = exception;
+        }
+
+        if (closeFailure != null) {
+            boolean warningOk = writeLine(
+                    err,
+                    "Credential " + credentialId
+                            + " committed; database connection cleanup failed "
+                            + "(SQLState " + sqlState(closeFailure) + ").");
+
+            stderrOk = warningOk && stderrOk;
+        }
+
+        if (!stdoutOk) {
+            boolean recoveryOk = writeLine(
+                    err,
+                    "Credential " + credentialId
+                            + " committed; stdout failed; "
+                            + "issue a replacement credential, then revoke "
+                            + credentialId + ".");
+
+            stderrOk = recoveryOk && stderrOk;
+        }
+
+        return stdoutOk && stderrOk && !outputHasError(out)
+                        && !outputHasError(err)
+                ? 0
+                : 1;
+    }
+
+    private static boolean writeLine(PrintStream stream, String value) {
+        try {
+            stream.print(value + System.lineSeparator());
+            return !stream.checkError();
+        } catch (RuntimeException exception) {
+            // Preserve transaction outcome; never expose the cause.
+            return false;
+        }
+    }
+
+    private static boolean outputHasError(PrintStream stream) {
+        try {
+            return stream.checkError();
+        } catch (RuntimeException exception) {
+            return true;
+        }
+    }
+
+    private static final class MissingProjectException
+            extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        private MissingProjectException() {
+            super(null, null, false, false);
         }
     }
 

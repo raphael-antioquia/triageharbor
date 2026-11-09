@@ -1,0 +1,413 @@
+package com.triageharbor;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.Map;
+import java.util.UUID;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+
+@SpringBootTest
+@Import(RoleSeparatedPostgresTestConfiguration.class)
+class CredentialAdminIssueTests {
+
+    private static final String PASSWORD = "test-migrator-password";
+
+    @Autowired
+    private PostgreSQLContainer postgresContainer;
+
+    @Test
+    void issuePrintsCanonicalTokenOnlyAfterCommitAndStoresItsHash()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "issue-project");
+
+        CommitObservingOutputStream stdout =
+                new CommitObservingOutputStream(projectId);
+
+        CommitObservingOutputStream stderr =
+                new CommitObservingOutputStream(projectId);
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+        assertThat(stdout.firstWriteObserved()).isTrue();
+        assertThat(stdout.committedAtFirstWrite()).isTrue();
+
+        String output = stdout.content();
+        String token = output.stripTrailing();
+
+        assertThat(output).isEqualTo(token + System.lineSeparator());
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+
+        byte[] randomBytes =
+                Base64.getUrlDecoder().decode(token.substring(3));
+
+        assertThat(randomBytes).hasSize(32);
+
+        assertThat(
+                Base64.getUrlEncoder()
+                        .withoutPadding()
+                        .encodeToString(randomBytes))
+                .isEqualTo(token.substring(3));
+
+        byte[] expectedHash =
+                MessageDigest.getInstance("SHA-256")
+                        .digest(token.getBytes(StandardCharsets.UTF_8));
+
+        String hashHex = HexFormat.of().formatHex(expectedHash);
+        UUID credentialId;
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id, project_id, key_hash,
+                                       key_prefix, created_at, revoked_at
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject("id", UUID.class);
+
+                assertThat(rows.getObject("project_id", UUID.class))
+                        .isEqualTo(projectId);
+
+                assertThat(rows.getBytes("key_hash"))
+                        .containsExactly(expectedHash);
+
+                assertThat(rows.getString("key_prefix"))
+                        .isEqualTo(token.substring(0, 11));
+
+                assertThat(rows.getObject("created_at")).isNotNull();
+                assertThat(rows.getObject("revoked_at")).isNull();
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        assertThat(stderr.firstWriteObserved()).isTrue();
+        assertThat(stderr.committedAtFirstWrite()).isTrue();
+
+        String diagnostics = stderr.content();
+
+        assertThat(diagnostics)
+                .contains(
+                        projectId.toString(),
+                        credentialId.toString(),
+                        "issue-project")
+                .doesNotContain(token, hashHex);
+    }
+
+    @Test
+    void missingProjectDoesNotIssueCredential() throws Exception {
+        UUID missingProject = UUID.randomUUID();
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(missingProject),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        // The FK already prevents orphan rows; this message is what
+        // distinguishes an explicit existence check from a 23503 failure.
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+        assertThat(stderr.toString(StandardCharsets.UTF_8))
+                .contains("Project not found.")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    void stdoutFailureAfterCommitReportsRecoveryWithoutToken()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "output-failure-project");
+
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        OutputStream failingOutput = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stdout failure");
+            }
+        };
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                failingOutput, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+
+            assertThat(out.checkError()).isTrue();
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+
+        UUID credentialId;
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject(1, UUID.class);
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        assertThat(diagnostics)
+                .contains(
+                        "Credential " + credentialId + " committed",
+                        "stdout",
+                        "issue a replacement",
+                        "revoke")
+                .doesNotContain("not committed", "rolled back")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    void repeatedIssueCreatesDistinctActiveCredentials()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "repeat-project");
+
+        String first = issueToken(projectId);
+        String second = issueToken(projectId);
+
+        assertThat(first).isNotEqualTo(second);
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT count(*), count(DISTINCT key_hash)
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isEqualTo(2);
+                assertThat(rows.getInt(2)).isEqualTo(2);
+            }
+        }
+    }
+
+    private String issueToken(UUID projectId) {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+        return stdout.toString(StandardCharsets.UTF_8).stripTrailing();
+    }
+
+    private static String[] issueArgs(UUID projectId) {
+        return new String[] {
+            "issue", "--project", projectId.toString()
+        };
+    }
+
+    private Map<String, String> environment() {
+        return Map.of(
+                "DB_HOST", postgresContainer.getHost(),
+                "DB_PORT",
+                String.valueOf(postgresContainer.getMappedPort(5432)),
+                "DB_NAME", postgresContainer.getDatabaseName(),
+                "DB_MIGRATOR_USER", "triageharbor_migrator",
+                "DB_MIGRATOR_PASSWORD", PASSWORD);
+    }
+
+    private Connection migratorConnection() throws SQLException {
+        return DriverManager.getConnection(
+                postgresContainer.getJdbcUrl(),
+                "triageharbor_migrator",
+                PASSWORD);
+    }
+
+    private void insertProject(UUID projectId, String name)
+            throws SQLException {
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                INSERT INTO projects (id, name)
+                                VALUES (?, ?)
+                                """)) {
+
+            statement.setObject(1, projectId);
+            statement.setString(2, name);
+
+            assertThat(statement.executeUpdate()).isEqualTo(1);
+        }
+    }
+
+    private final class CommitObservingOutputStream
+            extends OutputStream {
+
+        private final UUID projectId;
+        private final ByteArrayOutputStream delegate =
+                new ByteArrayOutputStream();
+
+        private boolean firstWriteObserved;
+        private boolean committedAtFirstWrite;
+
+        private CommitObservingOutputStream(UUID projectId) {
+            this.projectId = projectId;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            observeCommit();
+            delegate.write(value);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length)
+                throws IOException {
+
+            observeCommit();
+            delegate.write(bytes, offset, length);
+        }
+
+        private void observeCommit() throws IOException {
+            if (firstWriteObserved) {
+                return;
+            }
+
+            firstWriteObserved = true;
+
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    if (!rows.next()) {
+                        throw new IOException(
+                                "Commit observation returned no row");
+                    }
+
+                    committedAtFirstWrite = rows.getInt(1) == 1;
+                }
+            } catch (SQLException exception) {
+                throw new IOException(
+                        "Could not inspect committed issuance",
+                        exception);
+            }
+        }
+
+        private boolean firstWriteObserved() {
+            return firstWriteObserved;
+        }
+
+        private boolean committedAtFirstWrite() {
+            return committedAtFirstWrite;
+        }
+
+        private String content() {
+            return delegate.toString(StandardCharsets.UTF_8);
+        }
+    }
+}
