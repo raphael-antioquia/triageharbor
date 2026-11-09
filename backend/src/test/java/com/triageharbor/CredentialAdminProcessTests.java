@@ -89,9 +89,11 @@ class CredentialAdminProcessTests {
                         "-cp",
                         System.getProperty("java.class.path"),
                         "com.triageharbor.CredentialAdmin",
-                        "list",
+                        "revoke",
                         "--project",
-                        PROJECT);
+                        PROJECT,
+                        "--credential",
+                        "22222222-2222-2222-2222-222222222222");
 
         // Do not inherit DB_* or unrelated secrets from the shell.
         builder.environment().clear();

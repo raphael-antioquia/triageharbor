@@ -56,7 +56,7 @@ class CredentialAdminDatabaseTests {
         assertThat(result.exitCode()).isEqualTo(1);
         assertThat(result.stdout()).isEmpty();
         assertThat(result.stderr())
-                .contains("not implemented in Batch A")
+                .contains("not implemented")
                 .doesNotContain("preflight failed");
 
         int credentialsAfter =
@@ -276,7 +276,11 @@ class CredentialAdminDatabaseTests {
             exitCode =
                     CredentialAdmin.run(
                             new String[] {
-                                "list", "--project", PROJECT
+                                "revoke",
+                                "--project",
+                                PROJECT,
+                                "--credential",
+                                "22222222-2222-2222-2222-222222222222"
                             },
                             env,
                             out,
