@@ -733,6 +733,267 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    void rollbackFailurePreservesOriginalMissingProjectError()
+            throws Exception {
+
+        UUID missingProject = UUID.randomUUID();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicBoolean closeAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+
+                                    // Fail before forwarding rollback.
+                                    throw new SQLException(
+                                            "synthetic rollback failure",
+                                            "08006");
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(missingProject),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            // The original failure stays authoritative.
+            assertThat(diagnostics)
+                    .isEqualTo(
+                            "Project not found. No credential was issued."
+                                    + System.lineSeparator());
+
+            assertThat(diagnostics)
+                    .doesNotContain(
+                            "synthetic rollback failure",
+                            "SQLState 08006",
+                            "Commit outcome uncertain")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(rollbackAttempted.get()).isTrue();
+            assertThat(closeAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void deadConnectionAfterCommitKeepsUncertainOutcomeAndOriginalSqlState()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "dead-connection-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicBoolean closeAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+
+                                    // Simulated unavailable connection.
+                                    throw new SQLException(
+                                            "synthetic dead connection",
+                                            "08003");
+                                }
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeAttempted.set(true);
+                                }
+
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    if ("commit".equals(methodName)) {
+                                        // The real COMMIT succeeded.
+                                        // The acknowledgment is lost.
+                                        throw new SQLException(
+                                                "synthetic lost acknowledgment",
+                                                "08006");
+                                    }
+
+                                    if ("close".equals(methodName)) {
+                                        // The real connection is closed.
+                                        // Its acknowledgment also fails.
+                                        throw new SQLException(
+                                                "synthetic dead connection",
+                                                "08003");
+                                    }
+
+                                    return result;
+
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            UUID credentialId;
+
+            // Outcome first: COMMIT actually succeeded.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject(1, UUID.class);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            // COMMIT's original SQLState must remain authoritative.
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "Commit outcome uncertain for credential "
+                                    + credentialId,
+                            "(SQLState 08006)",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke " + credentialId)
+                    .doesNotContain(
+                            "SQLState 08003",
+                            "No credential was issued",
+                            "Credential " + credentialId + " committed",
+                            "synthetic")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            // Confirm all three injected failure paths executed.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(rollbackAttempted.get()).isTrue();
+            assertThat(closeAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
