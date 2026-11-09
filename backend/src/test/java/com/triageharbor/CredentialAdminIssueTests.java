@@ -563,6 +563,176 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    void connectionCloseFailureAfterCommitIsWarningOnly()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "close-failure-project");
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicReference<String> stdoutAtClose =
+                new AtomicReference<>();
+        AtomicReference<String> stderrAtClose =
+                new AtomicReference<>();
+
+        AtomicBoolean commitConfirmed = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    if ("commit".equals(methodName)) {
+                                        commitConfirmed.set(true);
+                                    }
+
+                                    if ("close".equals(methodName)) {
+                                        // Real connection is already closed.
+                                        // Capture output present at close.
+                                        stdoutAtClose.set(
+                                                stdout.toString(
+                                                        StandardCharsets.UTF_8));
+                                        stderrAtClose.set(
+                                                stderr.toString(
+                                                        StandardCharsets.UTF_8));
+
+                                        throw new SQLException(
+                                                "synthetic close failure",
+                                                "08006");
+                                    }
+
+                                    return result;
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isZero();
+            assertThat(commitConfirmed.get()).isTrue();
+
+            String output =
+                    stdout.toString(StandardCharsets.UTF_8);
+
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output)
+                    .isEqualTo(token + System.lineSeparator());
+
+            // Token must exist before connection.close().
+            assertThat(stdoutAtClose.get()).isEqualTo(output);
+
+            byte[] expectedHash =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(token.getBytes(StandardCharsets.UTF_8));
+
+            UUID credentialId;
+
+            // Independent database connection confirms persistence.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id, key_hash, key_prefix,
+                                           revoked_at
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject("id", UUID.class);
+
+                    assertThat(rows.getBytes("key_hash"))
+                            .containsExactly(expectedHash);
+
+                    assertThat(rows.getString("key_prefix"))
+                            .isEqualTo(token.substring(0, 11));
+
+                    assertThat(rows.getObject("revoked_at")).isNull();
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            String committedMetadata =
+                    "Credential " + credentialId
+                            + " committed for project " + projectId;
+
+            // Metadata precedes close; the warning follows close.
+            assertThat(stderrAtClose.get())
+                    .contains(committedMetadata)
+                    .doesNotContain(
+                            "database connection cleanup failed");
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            committedMetadata,
+                            "Credential " + credentialId
+                                    + " committed; database connection "
+                                    + "cleanup failed (SQLState 08006).")
+                    .doesNotContain(
+                            token,
+                            "synthetic close failure",
+                            "No credential was issued")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // Close underlying JDBC connection if an assertion fails.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
