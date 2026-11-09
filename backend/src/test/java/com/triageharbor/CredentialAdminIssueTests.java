@@ -994,6 +994,117 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    void brokenStderrBeforeCommitPreventsIssuance() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "broken-stderr-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        OutputStream brokenStderr = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stderr failure");
+            }
+        };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    brokenStderr, true, StandardCharsets.UTF_8)) {
+
+                // Prime the sticky error state before issuance.
+                err.print('x');
+                assertThat(err.checkError()).isTrue();
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+
+            // Outcome first: no credential may survive.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            // Mechanism second: rollback, never COMMIT.
+            assertThat(commitAttempted.get()).isFalse();
+            assertThat(rollbackAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
