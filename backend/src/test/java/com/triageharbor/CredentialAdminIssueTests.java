@@ -7,6 +7,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.sql.Connection;
@@ -15,6 +17,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Base64;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
@@ -268,6 +271,158 @@ class CredentialAdminIssueTests {
                 assertThat(rows.next()).isTrue();
                 assertThat(rows.getInt(1)).isEqualTo(2);
                 assertThat(rows.getInt(2)).isEqualTo(2);
+            }
+        }
+    }
+
+    @Test
+    void commitSucceedsButAcknowledgmentIsLost() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "lost-ack-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    // The actual database COMMIT succeeded.
+                                    // Simulate losing its acknowledgment.
+                                    if ("commit".equals(method.getName())) {
+                                        throw new SQLException(
+                                                "synthetic lost acknowledgment",
+                                                "08006");
+                                    }
+
+                                    return result;
+                                } catch (InvocationTargetException exception) {
+                                    // Preserve the original JDBC exception.
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+
+            UUID credentialId;
+
+            // Another connection must see the committed credential.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject(1, UUID.class);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "Commit outcome uncertain for credential "
+                                    + credentialId,
+                            "SQLState 08006",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke " + credentialId)
+                    .doesNotContain(
+                            "Credential " + credentialId + " committed",
+                            "synthetic lost acknowledgment",
+                            "No credential was issued")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            // Verify the documented recovery path with the real CLI.
+            ByteArrayOutputStream listStdout =
+                    new ByteArrayOutputStream();
+            ByteArrayOutputStream listStderr =
+                    new ByteArrayOutputStream();
+
+            int listExitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    listStdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    listStderr, true, StandardCharsets.UTF_8)) {
+
+                listExitCode = CredentialAdmin.run(
+                        new String[] {
+                            "list", "--project", projectId.toString()
+                        },
+                        environment(),
+                        out,
+                        err);
+            }
+
+            assertThat(listExitCode).isZero();
+
+            assertThat(listStdout.toString(StandardCharsets.UTF_8))
+                    .contains(credentialId.toString())
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(listStderr.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // Do not leak the real PostgreSQL connection if an
+            // assertion fails before the normal close check.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
             }
         }
     }
