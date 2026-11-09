@@ -17,10 +17,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Base64;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -419,6 +420,141 @@ class CredentialAdminIssueTests {
         } finally {
             // Do not leak the real PostgreSQL connection if an
             // assertion fails before the normal close check.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void commitInterceptedBeforeServerDoesNotPersistCredential()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "intercepted-commit-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicReference<Boolean> autoCommitAtCommit =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                    autoCommitAtCommit.set(
+                                            actual.getAutoCommit());
+
+                                    // Never forward COMMIT to PostgreSQL.
+                                    throw new SQLException(
+                                            "synthetic intercepted commit",
+                                            "08006");
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+
+            // Outcome first: an independent connection must see no
+            // credential after the intercepted COMMIT.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            // Mechanism second: explain why the outcome held.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(autoCommitAtCommit.get()).isEqualTo(false);
+            assertThat(rollbackAttempted.get()).isTrue();
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "SQLState 08006",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke ")
+                    .containsPattern(
+                            "Commit outcome uncertain for credential "
+                                    + "[0-9a-f]{8}-[0-9a-f]{4}-"
+                                    + "[0-9a-f]{4}-[0-9a-f]{4}-"
+                                    + "[0-9a-f]{12}")
+                    .doesNotContain(
+                            "No credential was issued",
+                            "synthetic intercepted commit")
+                    .doesNotContainPattern(
+                            "Credential [0-9a-f-]{36} committed")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // A failed assertion must not leak the real connection
+            // or leave a project-row lock open.
             Connection actual = underlyingConnection.get();
 
             if (actual != null && !actual.isClosed()) {
