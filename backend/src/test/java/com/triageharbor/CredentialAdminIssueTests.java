@@ -1811,6 +1811,62 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    void issueEscapesHostileProjectNameInDiagnostics()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+
+        String hostileName =
+                "evil" + (char) 0x1b + "[31m"
+                        + "\nfake" + (char) 0x202e + "line";
+
+        insertProject(projectId, hostileName);
+
+        ByteArrayOutputStream stdout =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+
+        String token =
+                stdout.toString(StandardCharsets.UTF_8)
+                        .stripTrailing();
+
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        // Control characters must be visible, inert and single-line.
+        assertThat(diagnostics)
+                .contains(
+                        "(name=evil\\u{1b}[31m\\nfake\\u{202e}line)")
+                .doesNotContain(
+                        String.valueOf((char) 0x1b),
+                        String.valueOf((char) 0x202e),
+                        token);
+
+        assertThat(diagnostics.lines()).hasSize(1);
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
