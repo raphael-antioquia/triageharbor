@@ -241,7 +241,7 @@ public final class CredentialAdmin {
         }
     }
 
-    private enum IssueOutcome {
+    private enum CommitOutcome {
         NOT_COMMITTED,
         COMMIT_UNCERTAIN,
         COMMITTED
@@ -254,7 +254,7 @@ public final class CredentialAdmin {
             PrintStream err,
             ConnectionOpener connectionOpener) {
 
-        IssueOutcome outcome = IssueOutcome.NOT_COMMITTED;
+        CommitOutcome outcome = CommitOutcome.NOT_COMMITTED;
         UUID credentialId = null;
         String metadata = null;
         Exception failure = null;
@@ -380,17 +380,17 @@ public final class CredentialAdmin {
             }
 
             // A COMMIT exception always produces an uncertain outcome.
-            outcome = IssueOutcome.COMMIT_UNCERTAIN;
+            outcome = CommitOutcome.COMMIT_UNCERTAIN;
 
             connection.commit();
 
-            outcome = IssueOutcome.COMMITTED;
+            outcome = CommitOutcome.COMMITTED;
 
         } catch (SQLException | RuntimeException exception) {
             failure = exception;
         }
 
-        if (outcome != IssueOutcome.COMMITTED) {
+        if (outcome != CommitOutcome.COMMITTED) {
             // Rollback is attempted for both definitely uncommitted
             // and uncertain outcomes. Never replace the original error.
             try {
@@ -409,7 +409,7 @@ public final class CredentialAdmin {
                 }
             }
 
-            if (outcome == IssueOutcome.COMMIT_UNCERTAIN) {
+            if (outcome == CommitOutcome.COMMIT_UNCERTAIN) {
                 return report(
                         err,
                         1,
