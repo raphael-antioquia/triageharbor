@@ -1556,6 +1556,261 @@ class CredentialAdminIssueTests {
         }
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void issuanceProjectLockAllowsNewIncidentInsert()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "lock-compatibility-project");
+
+        // Force a new incident, not a conflict-update path.
+        String fingerprint = "lock-" + UUID.randomUUID();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicInteger probeCalls = new AtomicInteger();
+        AtomicInteger incidentRowsInserted = new AtomicInteger();
+
+        AtomicReference<String> lockObservation =
+                new AtomicReference<>();
+
+        AtomicReference<String> incidentFailureState =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("prepareStatement".equals(methodName)
+                                        && arguments != null
+                                        && arguments.length > 0
+                                        && arguments[0] instanceof String sql
+                                        && sql.contains(
+                                                "INSERT INTO project_ingest_credentials")) {
+
+                                    // CredentialAdmin has completed its
+                                    // project SELECT ... FOR NO KEY UPDATE.
+                                    probeCalls.incrementAndGet();
+
+                                    // Precondition: a separate transaction
+                                    // cannot acquire that same row lock.
+                                    try (Connection observer =
+                                                    migratorConnection();
+                                            PreparedStatement probeLock =
+                                                    observer.prepareStatement(
+                                                            """
+                                                            SELECT id
+                                                            FROM projects
+                                                            WHERE id = ?
+                                                            FOR NO KEY UPDATE NOWAIT
+                                                            """)) {
+
+                                        probeLock.setObject(1, projectId);
+
+                                        try (ResultSet rows =
+                                                probeLock.executeQuery()) {
+
+                                            assertThat(rows.next()).isTrue();
+                                            assertThat(rows.next()).isFalse();
+                                        }
+
+                                        lockObservation.set("not locked");
+
+                                    } catch (SQLException exception) {
+                                        lockObservation.set(
+                                                exception.getSQLState());
+                                    }
+
+                                    // Attempt a new incident INSERT using
+                                    // the actual runtime database role.
+                                    try (Connection app =
+                                            DriverManager.getConnection(
+                                                    postgresContainer.getJdbcUrl(),
+                                                    "triageharbor_app",
+                                                    "test-app-password")) {
+
+                                        app.setAutoCommit(false);
+
+                                        try {
+                                            try (java.sql.Statement timeouts =
+                                                    app.createStatement()) {
+
+                                                // Short lock wait; the
+                                                // statement timeout is a
+                                                // separate safety backstop.
+                                                timeouts.execute(
+                                                        "SET LOCAL lock_timeout = '1s'");
+
+                                                timeouts.execute(
+                                                        "SET LOCAL statement_timeout = '3s'");
+                                            }
+
+                                            try (PreparedStatement incident =
+                                                    app.prepareStatement(
+                                                            """
+                                                            INSERT INTO incidents (
+                                                                project_id,
+                                                                fingerprint,
+                                                                fingerprint_version,
+                                                                title,
+                                                                first_seen_at,
+                                                                last_seen_at
+                                                            )
+                                                            VALUES (?, ?, 1, ?, now(), now())
+                                                            """)) {
+
+                                                incident.setObject(
+                                                        1, projectId);
+
+                                                incident.setString(
+                                                        2, fingerprint);
+
+                                                incident.setString(
+                                                        3,
+                                                        "Lock compatibility probe");
+
+                                                incidentRowsInserted.set(
+                                                        incident.executeUpdate());
+                                            }
+
+                                        } finally {
+                                            // Preserve isolation between
+                                            // tests: do not persist probe.
+                                            app.rollback();
+                                        }
+
+                                    } catch (SQLException exception) {
+                                        incidentFailureState.set(
+                                                exception.getSQLState());
+                                    }
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout =
+                new ByteArrayOutputStream();
+
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            // The real credential issuance command succeeded.
+            assertThat(exitCode).isZero();
+
+            // First verify our interception and lock precondition.
+            assertThat(probeCalls.get()).isEqualTo(1);
+            assertThat(lockObservation.get()).isEqualTo("55P03");
+
+            // Then verify compatibility with incident creation.
+            assertThat(incidentFailureState.get()).isNull();
+            assertThat(incidentRowsInserted.get()).isEqualTo(1);
+
+            String output =
+                    stdout.toString(StandardCharsets.UTF_8);
+
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output)
+                    .isEqualTo(token + System.lineSeparator());
+
+            byte[] expectedHash =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(token.getBytes(StandardCharsets.UTF_8));
+
+            // Independently verify the committed credential.
+            try (Connection verification = migratorConnection();
+                    PreparedStatement credential =
+                            verification.prepareStatement(
+                                    """
+                                    SELECT key_hash
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """);
+                    PreparedStatement incident =
+                            verification.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM incidents
+                                    WHERE project_id = ?
+                                      AND fingerprint = ?
+                                    """)) {
+
+                credential.setObject(1, projectId);
+
+                try (ResultSet rows = credential.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    assertThat(rows.getBytes("key_hash"))
+                            .containsExactly(expectedHash);
+
+                    assertThat(rows.next()).isFalse();
+                }
+
+                // The probe INSERT succeeded, but was rolled back.
+                incident.setObject(1, projectId);
+                incident.setString(2, fingerprint);
+
+                try (ResultSet rows = incident.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            assertThat(stderr.toString(StandardCharsets.UTF_8))
+                    .contains(
+                            "committed for project " + projectId)
+                    .doesNotContain(token)
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
     private String issueToken(UUID projectId) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
