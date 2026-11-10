@@ -16,14 +16,19 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
@@ -1405,6 +1410,150 @@ class CredentialAdminIssueTests {
                         "synthetic partial stdout failure",
                         "No credential was issued")
                 .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void issueTimesOutOnHeldProjectLockWithoutPersisting()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "locked-project");
+
+        record IssueResult(
+                int exitCode, String stdout, String stderr) {}
+
+        ExecutorService executor =
+                Executors.newSingleThreadExecutor();
+
+        try (Connection lockHolder = migratorConnection()) {
+            lockHolder.setAutoCommit(false);
+
+            try {
+                // Hold the same project-row lock issuance needs.
+                try (PreparedStatement statement =
+                        lockHolder.prepareStatement(
+                                """
+                                SELECT id
+                                FROM projects
+                                WHERE id = ?
+                                FOR NO KEY UPDATE
+                                """)) {
+
+                    statement.setObject(1, projectId);
+
+                    try (ResultSet rows = statement.executeQuery()) {
+                        assertThat(rows.next()).isTrue();
+
+                        assertThat(rows.getObject(1, UUID.class))
+                                .isEqualTo(projectId);
+
+                        assertThat(rows.next()).isFalse();
+                    }
+                }
+
+                // Autocommit is off, so the lock remains held.
+                long startedAt = System.nanoTime();
+
+                Future<IssueResult> pending =
+                        executor.submit(() -> {
+                            ByteArrayOutputStream stdout =
+                                    new ByteArrayOutputStream();
+
+                            ByteArrayOutputStream stderr =
+                                    new ByteArrayOutputStream();
+
+                            int exitCode;
+
+                            try (PrintStream out =
+                                            new PrintStream(
+                                                    stdout,
+                                                    true,
+                                                    StandardCharsets.UTF_8);
+                                    PrintStream err =
+                                            new PrintStream(
+                                                    stderr,
+                                                    true,
+                                                    StandardCharsets.UTF_8)) {
+
+                                exitCode = CredentialAdmin.run(
+                                        issueArgs(projectId),
+                                        environment(),
+                                        out,
+                                        err);
+                            }
+
+                            return new IssueResult(
+                                    exitCode,
+                                    stdout.toString(
+                                            StandardCharsets.UTF_8),
+                                    stderr.toString(
+                                            StandardCharsets.UTF_8));
+                        });
+
+                // Fail independently if PostgreSQL does not return.
+                IssueResult result =
+                        pending.get(15, TimeUnit.SECONDS);
+
+                long elapsedMillis =
+                        TimeUnit.NANOSECONDS.toMillis(
+                                System.nanoTime() - startedAt);
+
+                // Observable operator outcome first.
+                assertThat(result.exitCode()).isEqualTo(1);
+                assertThat(result.stdout()).isEmpty();
+
+                assertThat(result.stderr())
+                        .contains(
+                                "SQLState 55P03",
+                                "No credential was issued.")
+                        .doesNotContain(
+                                "Commit outcome uncertain",
+                                "committed for project")
+                        .doesNotContainPattern(
+                                "th_[A-Za-z0-9_-]{43}");
+
+                // The configured 5-second timeout must apply.
+                assertThat(elapsedMillis)
+                        .isBetween(3500L, 14999L);
+
+                // Verify persistence independently.
+                try (Connection verification =
+                                migratorConnection();
+                        PreparedStatement statement =
+                                verification.prepareStatement(
+                                        """
+                                        SELECT count(*)
+                                        FROM project_ingest_credentials
+                                        WHERE project_id = ?
+                                        """)) {
+
+                    statement.setObject(1, projectId);
+
+                    try (ResultSet rows =
+                            statement.executeQuery()) {
+
+                        assertThat(rows.next()).isTrue();
+                        assertThat(rows.getLong(1)).isZero();
+                    }
+                }
+
+            } finally {
+                // Release the project lock even if the worker
+                // times out or an assertion fails.
+                lockHolder.rollback();
+            }
+
+        } finally {
+            executor.shutdown();
+
+            // Allow a previously blocked worker to finish
+            // after the lock-holder transaction is released.
+            if (!executor.awaitTermination(
+                    10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        }
     }
 
     private String issueToken(UUID projectId) {
