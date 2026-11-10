@@ -247,6 +247,42 @@ public final class CredentialAdmin {
         COMMITTED
     }
 
+    private static String lockProjectForCredentialMutation(
+            Connection connection, UUID projectId) throws SQLException {
+
+        // Revoke's last-key guard needs a fresh snapshot per statement
+        // after waiting for the lock; do not raise this level.
+        connection.setTransactionIsolation(
+                Connection.TRANSACTION_READ_COMMITTED);
+
+        // Both must precede the first transactional statement.
+        connection.setAutoCommit(false);
+
+        try (Statement timeout = connection.createStatement()) {
+            timeout.execute("SET LOCAL lock_timeout = '5s'");
+        }
+
+        try (PreparedStatement lock =
+                connection.prepareStatement(
+                        """
+                        SELECT name
+                        FROM projects
+                        WHERE id = ?
+                        FOR NO KEY UPDATE
+                        """)) {
+
+            lock.setObject(1, projectId);
+
+            try (ResultSet rows = lock.executeQuery()) {
+                if (!rows.next()) {
+                    throw new MissingProjectException();
+                }
+
+                return rows.getString(1);
+            }
+        }
+    }
+
     private static int issueCredential(
             DatabaseConfig config,
             UUID projectId,
@@ -306,34 +342,8 @@ public final class CredentialAdmin {
         }
 
         try {
-            // This must happen before executing any SQL.
-            connection.setAutoCommit(false);
-
-            try (Statement timeout = connection.createStatement()) {
-                timeout.execute("SET LOCAL lock_timeout = '5s'");
-            }
-
-            String projectName;
-
-            try (PreparedStatement lock =
-                    connection.prepareStatement(
-                            """
-                            SELECT name
-                            FROM projects
-                            WHERE id = ?
-                            FOR NO KEY UPDATE
-                            """)) {
-
-                lock.setObject(1, projectId);
-
-                try (ResultSet rows = lock.executeQuery()) {
-                    if (!rows.next()) {
-                        throw new MissingProjectException();
-                    }
-
-                    projectName = rows.getString(1);
-                }
-            }
+            String projectName =
+                    lockProjectForCredentialMutation(connection, projectId);
 
             try (PreparedStatement insert =
                     connection.prepareStatement(
