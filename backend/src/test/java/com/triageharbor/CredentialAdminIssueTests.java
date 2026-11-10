@@ -16,6 +16,7 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.Map;
@@ -1231,6 +1232,179 @@ class CredentialAdminIssueTests {
                 actual.close();
             }
         }
+    }
+
+    @Test
+    void partialStdoutFailureDoesNotRetryOrLeakToken()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "partial-stdout-project");
+
+        ByteArrayOutputStream acceptedBytes =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream offeredBytes =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        AtomicInteger tokenPrintAttempts = new AtomicInteger();
+        AtomicReference<String> offeredTokenLine =
+                new AtomicReference<>();
+
+        // Accept the first 20 bytes, then fail permanently.
+        OutputStream partialStdout = new OutputStream() {
+            private int acceptedCount;
+
+            @Override
+            public void write(int value) throws IOException {
+                offeredBytes.write(value);
+
+                if (acceptedCount == 20) {
+                    throw new IOException(
+                            "synthetic partial stdout failure");
+                }
+
+                acceptedBytes.write(value);
+                acceptedCount++;
+            }
+
+            @Override
+            public void write(
+                    byte[] bytes, int offset, int length)
+                    throws IOException {
+
+                offeredBytes.write(bytes, offset, length);
+
+                int allowed =
+                        Math.min(length, 20 - acceptedCount);
+
+                acceptedBytes.write(bytes, offset, allowed);
+                acceptedCount += allowed;
+
+                if (allowed < length) {
+                    throw new IOException(
+                            "synthetic partial stdout failure");
+                }
+            }
+        };
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                partialStdout,
+                                true,
+                                StandardCharsets.UTF_8) {
+
+                            @Override
+                            public void print(String value) {
+                                if (value.startsWith("th_")) {
+                                    tokenPrintAttempts.incrementAndGet();
+                                    offeredTokenLine.set(value);
+                                }
+
+                                super.print(value);
+                            }
+                        };
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+
+            assertThat(out.checkError()).isTrue();
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+
+        UUID credentialId;
+        byte[] storedHash;
+
+        // Database outcome first: the credential was committed.
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id, key_hash, key_prefix
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject("id", UUID.class);
+                storedHash = rows.getBytes("key_hash");
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        // Recover the intended token from the print argument,
+        // not from the 20 bytes accepted by the destination.
+        assertThat(offeredTokenLine.get()).isNotNull();
+
+        String offeredLine = offeredTokenLine.get();
+        String token = offeredLine.stripTrailing();
+
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+        assertThat(offeredLine)
+                .isEqualTo(token + System.lineSeparator());
+
+        assertThat(storedHash)
+                .containsExactly(
+                        MessageDigest.getInstance("SHA-256")
+                                .digest(token.getBytes(
+                                        StandardCharsets.UTF_8)));
+
+        // Exactly the first 20 bytes were accepted.
+        String accepted =
+                acceptedBytes.toString(StandardCharsets.UTF_8);
+
+        assertThat(acceptedBytes.size()).isEqualTo(20);
+        assertThat(accepted)
+                .isEqualTo(token.substring(0, 20));
+
+        // Strongest retry invariant first: the entire output
+        // offered to the destination is exactly one token line.
+        byte[] expectedLine =
+                (token + System.lineSeparator())
+                        .getBytes(StandardCharsets.UTF_8);
+
+        assertThat(offeredBytes.size())
+                .isEqualTo(expectedLine.length);
+
+        assertThat(MessageDigest.isEqual(
+                offeredBytes.toByteArray(), expectedLine))
+                .isTrue();
+
+        // Mechanism second: one application-level print call.
+        assertThat(tokenPrintAttempts.get()).isEqualTo(1);
+
+        // Recovery must not expose the token or its partial prefix.
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        assertThat(diagnostics)
+                .contains(
+                        "Credential " + credentialId + " committed",
+                        "stdout failed",
+                        "issue a replacement credential, then revoke "
+                                + credentialId)
+                .doesNotContain(
+                        token,
+                        accepted,
+                        "synthetic partial stdout failure",
+                        "No credential was issued")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
     }
 
     private String issueToken(UUID projectId) {
