@@ -40,7 +40,7 @@ class CredentialAdminDatabaseTests {
     private JdbcTemplate jdbcTemplate;
 
     @Test
-    void migratedDatabasePassesPreflightWithoutExecutingCommand() {
+    void migratedDatabasePassesPreflightAndRejectsMissingProject() {
         Map<String, String> env = environment(postgresContainer);
 
         int credentialsBefore =
@@ -56,7 +56,7 @@ class CredentialAdminDatabaseTests {
         assertThat(result.exitCode()).isEqualTo(1);
         assertThat(result.stdout()).isEmpty();
         assertThat(result.stderr())
-                .contains("not implemented")
+                .contains("Project not found. No credential was revoked.")
                 .doesNotContain("preflight failed");
 
         int credentialsAfter =

@@ -151,12 +151,13 @@ public final class CredentialAdmin {
                     connectionOpener);
         }
 
-        // Revoke remains unimplemented until B3.
-        return report(
+        return revokeCredential(
+                config,
+                command.projectId(),
+                command.credentialId(),
+                command.forceLast(),
                 err,
-                1,
-                "Command " + command.verb() + " is not implemented yet.",
-                false);
+                connectionOpener);
     }
 
     // Package-private entry point for preflight integration tests.
@@ -493,6 +494,305 @@ public final class CredentialAdmin {
                 : 1;
     }
 
+    private static int revokeCredential(
+            DatabaseConfig config,
+            UUID projectId,
+            UUID credentialId,
+            boolean forceLast,
+            PrintStream err,
+            ConnectionOpener connectionOpener) {
+
+        CommitOutcome outcome = CommitOutcome.NOT_COMMITTED;
+        boolean alreadyRevoked = false;
+        boolean revokesLastActive = false;
+        String receipt = null;
+        Exception failure = null;
+
+        // If opening fails, no SQL has executed.
+        Connection connection;
+
+        try {
+            connection = connectionOpener.open(
+                    config.jdbcUrl,
+                    config.username,
+                    config.password);
+        } catch (SQLException | RuntimeException exception) {
+            return report(
+                    err,
+                    1,
+                    "Database connection failed (SQLState "
+                            + sqlState(exception)
+                            + "). No credential was revoked.",
+                    false);
+        }
+
+        try {
+            String projectName =
+                    lockProjectForCredentialMutation(connection, projectId);
+
+            String project = "project " + projectId
+                    + " (name=" + escapeTsv(projectName) + ")";
+
+            OffsetDateTime revokedAt;
+
+            // Scoped by project: another project's credential never matches.
+            try (PreparedStatement lookup =
+                    connection.prepareStatement(
+                            """
+                            SELECT revoked_at
+                            FROM project_ingest_credentials
+                            WHERE project_id = ?
+                              AND id = ?
+                            """)) {
+
+                lookup.setObject(1, projectId);
+                lookup.setObject(2, credentialId);
+
+                try (ResultSet rows = lookup.executeQuery()) {
+                    if (!rows.next()) {
+                        throw new MissingCredentialException();
+                    }
+
+                    revokedAt = rows.getObject(1, OffsetDateTime.class);
+                }
+            }
+
+            if (revokedAt != null) {
+                // Idempotent success, checked before the last-key guard.
+                receipt = "Credential " + credentialId
+                        + " already revoked at "
+                        + UTC_MICROS.format(revokedAt.toInstant())
+                        + " for " + project + ". No change made.";
+
+                // Last statement in this try: nothing can fail after it.
+                alreadyRevoked = true;
+            } else {
+                long activeCount;
+
+                // Guard and UPDATE both run under the project lock.
+                try (PreparedStatement count =
+                        connection.prepareStatement(
+                                """
+                                SELECT count(*)
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+                    count.setObject(1, projectId);
+
+                    try (ResultSet rows = count.executeQuery()) {
+                        if (!rows.next()) {
+                            throw new SQLException(
+                                    "Active credential count returned no row",
+                                    "XX000");
+                        }
+
+                        activeCount = rows.getLong(1);
+                    }
+                }
+
+                // The target is active, so the count includes it.
+                if (activeCount < 1) {
+                    throw new SQLException(
+                            "Inconsistent active credential count",
+                            "XX000");
+                }
+
+                revokesLastActive = activeCount == 1;
+
+                if (revokesLastActive && !forceLast) {
+                    throw new LastActiveCredentialException();
+                }
+
+                try (PreparedStatement update =
+                        connection.prepareStatement(
+                                """
+                                UPDATE project_ingest_credentials
+                                SET revoked_at = now()
+                                WHERE id = ?
+                                  AND project_id = ?
+                                  AND revoked_at IS NULL
+                                RETURNING id
+                                """)) {
+
+                    update.setObject(1, credentialId);
+                    update.setObject(2, projectId);
+
+                    try (ResultSet rows = update.executeQuery()) {
+                        // Zero rows: changed outside the operator lock.
+                        if (!rows.next() || rows.next()) {
+                            throw new SQLException(
+                                    "Unexpected credential UPDATE result",
+                                    "XX000");
+                        }
+                    }
+                }
+
+                // Prepare output before COMMIT so reporting cannot throw after it.
+                receipt = "Credential " + credentialId
+                        + " revoked for " + project + ".";
+
+                // A COMMIT exception always produces an uncertain outcome.
+                outcome = CommitOutcome.COMMIT_UNCERTAIN;
+
+                connection.commit();
+
+                outcome = CommitOutcome.COMMITTED;
+            }
+        } catch (SQLException | RuntimeException exception) {
+            failure = exception;
+        }
+
+        if (outcome == CommitOutcome.COMMITTED) {
+            // COMMIT confirmed and lock released; never roll back.
+            boolean ok = writeLine(err, receipt);
+
+            if (revokesLastActive) {
+                ok = writeLine(
+                                err,
+                                "WARNING: project " + projectId
+                                        + " now has no active ingest credential; "
+                                        + "ingestion fails until a new credential "
+                                        + "is issued.")
+                        && ok;
+            }
+
+            Throwable closeFailure = null;
+
+            try {
+                connection.close();
+            } catch (SQLException | RuntimeException exception) {
+                closeFailure = exception;
+            }
+
+            if (closeFailure != null) {
+                ok = writeLine(
+                                err,
+                                "Credential " + credentialId
+                                        + " revoked; database connection cleanup failed "
+                                        + "(SQLState " + sqlState(closeFailure) + ").")
+                        && ok;
+            }
+
+            return ok && !outputHasError(err) ? 0 : 1;
+        }
+
+        if (alreadyRevoked && failure == null) {
+            // The revoked state was committed by an earlier transaction.
+            // Release the project lock before reporting success.
+            Exception cleanupFailure = null;
+
+            try {
+                connection.rollback();
+            } catch (SQLException | RuntimeException exception) {
+                cleanupFailure = exception;
+            }
+
+            try {
+                connection.close();
+            } catch (SQLException | RuntimeException exception) {
+                if (cleanupFailure == null) {
+                    cleanupFailure = exception;
+                } else {
+                    cleanupFailure.addSuppressed(exception);
+                }
+            }
+
+            boolean ok = writeLine(err, receipt);
+
+            if (cleanupFailure != null) {
+                ok = writeLine(
+                                err,
+                                "Database connection cleanup failed (SQLState "
+                                        + sqlState(cleanupFailure)
+                                        + "); no change was needed.")
+                        && ok;
+            }
+
+            return ok && !outputHasError(err) ? 0 : 1;
+        }
+
+        // NOT_COMMITTED or COMMIT_UNCERTAIN. Never replace the original error.
+        try {
+            connection.rollback();
+        } catch (SQLException | RuntimeException rollbackFailure) {
+            if (failure != null) {
+                failure.addSuppressed(rollbackFailure);
+            }
+        }
+
+        try {
+            connection.close();
+        } catch (SQLException | RuntimeException closeFailure) {
+            if (failure != null) {
+                failure.addSuppressed(closeFailure);
+            }
+        }
+
+        if (outcome == CommitOutcome.COMMIT_UNCERTAIN) {
+            return report(
+                    err,
+                    1,
+                    "Revocation commit outcome uncertain for credential "
+                            + credentialId
+                            + " (SQLState " + sqlState(failure) + "). "
+                            + "The credential may still be active. "
+                            + "Re-run the identical revoke command"
+                            + (forceLast
+                                    ? ", including --force-last."
+                                    : ". If the last-credential guard rejects "
+                                            + "the retry, issue a replacement "
+                                            + "credential, then revoke "
+                                            + credentialId + ".")
+                            + (revokesLastActive
+                                    ? " If the revocation committed, project "
+                                            + projectId
+                                            + " has no active credential."
+                                    : ""),
+                    false);
+        }
+
+        if (failure instanceof MissingProjectException) {
+            return report(
+                    err,
+                    1,
+                    "Project not found. No credential was revoked.",
+                    false);
+        }
+
+        if (failure instanceof MissingCredentialException) {
+            return report(
+                    err,
+                    1,
+                    "Credential " + credentialId
+                            + " not found in project " + projectId
+                            + ". No credential was revoked.",
+                    false);
+        }
+
+        if (failure instanceof LastActiveCredentialException) {
+            return report(
+                    err,
+                    1,
+                    "Credential " + credentialId
+                            + " is the last active credential for project "
+                            + projectId
+                            + ". Issue a replacement credential first, or re-run "
+                            + "with --force-last to leave the project without an "
+                            + "active credential. No credential was revoked.",
+                    false);
+        }
+
+        return report(
+                err,
+                1,
+                "Credential revocation failed (SQLState "
+                        + sqlState(failure)
+                        + "). No change was committed.",
+                false);
+    }
+
     private static boolean writeLine(PrintStream stream, String value) {
         try {
             stream.print(value + System.lineSeparator());
@@ -508,6 +808,26 @@ public final class CredentialAdmin {
             return stream.checkError();
         } catch (RuntimeException exception) {
             return true;
+        }
+    }
+
+    private static final class MissingCredentialException
+            extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        private MissingCredentialException() {
+            super(null, null, false, false);
+        }
+    }
+
+    private static final class LastActiveCredentialException
+            extends RuntimeException {
+
+        private static final long serialVersionUID = 1L;
+
+        private LastActiveCredentialException() {
+            super(null, null, false, false);
         }
     }
 

@@ -43,7 +43,7 @@ class CredentialAdminProcessTests {
         // Confirm that the subprocess reached migration verification.
         assertThat(result.stderr())
                 .contains("Flyway migration verification succeeded")
-                .contains("not implemented")
+                .contains("Project not found. No credential was revoked.")
                 .doesNotContain("mode=migrate");
 
         // Positive evidence that the dedicated Logback file loaded.
