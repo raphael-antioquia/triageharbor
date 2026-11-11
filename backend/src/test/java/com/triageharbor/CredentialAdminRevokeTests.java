@@ -16,6 +16,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -450,22 +451,130 @@ class CredentialAdminRevokeTests {
                                 + System.lineSeparator());
     }
 
+    @Test
+    void issuingReplacementBeforeRevokePreservesActiveCredential()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID oldCredentialId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            oldCredentialId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        // Initial state: exactly one active credential.
+        assertThat(revokedAt(oldCredentialId)).isNull();
+        assertThat(activeCredentialCount(projectId)).isEqualTo(1);
+
+        // Issue a replacement through the real admin CLI.
+        Result issued = execute(
+                "issue", "--project", projectId.toString());
+
+        assertThat(issued.exitCode())
+                .as("Credential issuance must succeed")
+                .isZero();
+
+        String issueStdout = issued.stdout();
+
+        // Verify the entire stdout contract without printing
+        // the raw token in an assertion failure.
+        assertThat(issueStdout.matches(
+                "th_[A-Za-z0-9_-]{43}"
+                        + Pattern.quote(System.lineSeparator())))
+                .as("Issue stdout must contain exactly one canonical token")
+                .isTrue();
+
+        // Three-character prefix plus 43 base64url characters.
+        String replacementToken = issueStdout.substring(0, 46);
+
+        UUID replacementId;
+
+        try (Connection connection = migratorConnection()) {
+            replacementId = credentialId(
+                    connection, projectId, replacementToken);
+        }
+
+        assertThat(replacementId).isNotEqualTo(oldCredentialId);
+
+        // Replacement must be committed and active before
+        // the original credential is revoked.
+        assertThat(revokedAt(oldCredentialId)).isNull();
+
+        assertThat(revokedAt(replacementId))
+                .as("Replacement must be active before old-key revocation")
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+
+        String expectedIssueReceipt =
+                "Credential " + replacementId
+                        + " committed for project " + projectId
+                        + " (name=revoke-project)."
+                        + System.lineSeparator();
+
+        // Avoid displaying unexpected sensitive CLI output on failure.
+        assertThat(issued.stderr().equals(expectedIssueReceipt))
+                .as("Issue stderr must contain only the metadata receipt")
+                .isTrue();
+
+        // No force flag: the replacement makes this an ordinary revoke.
+        Result revoked = invoke(
+                projectId, oldCredentialId, false);
+
+        // Verify committed database state first.
+        assertThat(revokedAt(oldCredentialId))
+                .as("stderr: %s", revoked.stderr())
+                .isNotNull();
+
+        assertThat(revokedAt(replacementId))
+                .as("stderr: %s", revoked.stderr())
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("stderr: %s", revoked.stderr())
+                .isEqualTo(1);
+
+        assertThat(revoked.exitCode())
+                .as("stderr: %s", revoked.stderr())
+                .isZero();
+
+        assertThat(revoked.stdout()).isEmpty();
+
+        assertThat(revoked.stderr())
+                .isEqualTo(
+                        "Credential " + oldCredentialId
+                                + " revoked for project " + projectId
+                                + " (name=revoke-project)."
+                                + System.lineSeparator());
+    }
+
     private Result invoke(
             UUID projectId, UUID credentialId, boolean forceLast) {
 
+        if (forceLast) {
+            return execute(
+                    "revoke",
+                    "--project", projectId.toString(),
+                    "--credential", credentialId.toString(),
+                    "--force-last");
+        }
+
+        return execute(
+                "revoke",
+                "--project", projectId.toString(),
+                "--credential", credentialId.toString());
+    }
+
+    private Result execute(String... args) {
+
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-
-        String[] args = forceLast
-                ? new String[] {
-                    "revoke", "--project", projectId.toString(),
-                    "--credential", credentialId.toString(),
-                    "--force-last"
-                }
-                : new String[] {
-                    "revoke", "--project", projectId.toString(),
-                    "--credential", credentialId.toString()
-                };
 
         int exitCode;
 
