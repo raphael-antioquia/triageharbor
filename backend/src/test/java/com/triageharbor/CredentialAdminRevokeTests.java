@@ -194,6 +194,158 @@ class CredentialAdminRevokeTests {
                                 + System.lineSeparator());
     }
 
+    @Test
+    void credentialFromAnotherProjectIsNotFound()
+            throws Exception {
+
+        UUID projectA = UUID.randomUUID();
+        UUID projectB = UUID.randomUUID();
+        UUID credentialA1;
+        UUID credentialA2;
+        UUID credentialB;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectA);
+            insertProject(connection, projectB);
+
+            credentialA1 = credentialId(
+                    connection,
+                    projectA,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectA));
+
+            credentialA2 = credentialId(
+                    connection,
+                    projectA,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectA));
+
+            credentialB = credentialId(
+                    connection,
+                    projectB,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectB));
+        }
+
+        Result wrongProject = invoke(projectA, credentialB, false);
+
+        // The command must not modify either project.
+        assertThat(revokedAt(credentialA1))
+                .as("stderr: %s", wrongProject.stderr())
+                .isNull();
+
+        assertThat(revokedAt(credentialA2))
+                .as("stderr: %s", wrongProject.stderr())
+                .isNull();
+
+        assertThat(revokedAt(credentialB))
+                .as("stderr: %s", wrongProject.stderr())
+                .isNull();
+
+        assertThat(wrongProject.exitCode()).isEqualTo(1);
+        assertThat(wrongProject.stdout()).isEmpty();
+
+        assertThat(wrongProject.stderr())
+                .isEqualTo(
+                        "Credential " + credentialB
+                                + " not found in project " + projectA
+                                + ". No credential was revoked."
+                                + System.lineSeparator());
+
+        // Unknown and foreign credential IDs have equivalent
+        // not-found behavior.
+        UUID unknownCredential = UUID.randomUUID();
+
+        Result unknown = invoke(
+                projectA, unknownCredential, false);
+
+        assertThat(unknown.exitCode()).isEqualTo(1);
+        assertThat(unknown.stdout()).isEmpty();
+
+        assertThat(unknown.stderr())
+                .isEqualTo(
+                        "Credential " + unknownCredential
+                                + " not found in project " + projectA
+                                + ". No credential was revoked."
+                                + System.lineSeparator());
+
+        assertThat(revokedAt(credentialA1)).isNull();
+        assertThat(revokedAt(credentialA2)).isNull();
+        assertThat(revokedAt(credentialB)).isNull();
+    }
+
+    @Test
+    void lastActiveCredentialCannotBeRevokedWithoutForce()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+        UUID revokedSiblingId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            revokedSiblingId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            // Establish a revoked sibling independently of the CLI.
+            try (PreparedStatement revoke =
+                    connection.prepareStatement(
+                            """
+                            UPDATE project_ingest_credentials
+                            SET revoked_at = now()
+                            WHERE id = ?
+                              AND project_id = ?
+                              AND revoked_at IS NULL
+                            """)) {
+
+                revoke.setObject(1, revokedSiblingId);
+                revoke.setObject(2, projectId);
+
+                assertThat(revoke.executeUpdate()).isEqualTo(1);
+            }
+        }
+
+        OffsetDateTime siblingOriginal =
+                revokedAt(revokedSiblingId);
+
+        assertThat(revokedAt(targetId)).isNull();
+        assertThat(siblingOriginal).isNotNull();
+
+        Result result = invoke(projectId, targetId, false);
+
+        // One active credential must remain.
+        assertThat(revokedAt(targetId))
+                .as("stderr: %s", result.stderr())
+                .isNull();
+
+        // The already-revoked sibling must remain unchanged.
+        assertThat(revokedAt(revokedSiblingId))
+                .isEqualTo(siblingOriginal);
+
+        assertThat(result.exitCode()).isEqualTo(1);
+        assertThat(result.stdout()).isEmpty();
+
+        assertThat(result.stderr())
+                .isEqualTo(
+                        "Credential " + targetId
+                                + " is the last active credential for project "
+                                + projectId
+                                + ". Issue a replacement credential first, or re-run "
+                                + "with --force-last to leave the project without an "
+                                + "active credential. No credential was revoked."
+                                + System.lineSeparator());
+    }
+
     private Result invoke(
             UUID projectId, UUID credentialId, boolean forceLast) {
 
