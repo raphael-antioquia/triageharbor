@@ -346,6 +346,110 @@ class CredentialAdminRevokeTests {
                                 + System.lineSeparator());
     }
 
+    @Test
+    void forceLastRevokesFinalActiveCredentialWithWarning()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(revokedAt(targetId)).isNull();
+        assertThat(activeCredentialCount(projectId)).isEqualTo(1);
+
+        Result result = invoke(projectId, targetId, true);
+
+        // Explicit override: the final active key is revoked.
+        assertThat(revokedAt(targetId))
+                .as("stderr: %s", result.stderr())
+                .isNotNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("stderr: %s", result.stderr())
+                .isZero();
+
+        assertThat(result.exitCode())
+                .as("stderr: %s", result.stderr())
+                .isZero();
+
+        assertThat(result.stdout()).isEmpty();
+
+        // Exactly two lines: success receipt followed by WARNING.
+        assertThat(result.stderr())
+                .isEqualTo(
+                        "Credential " + targetId
+                                + " revoked for project " + projectId
+                                + " (name=revoke-project)."
+                                + System.lineSeparator()
+                                + "WARNING: project " + projectId
+                                + " now has no active ingest credential; "
+                                + "ingestion fails until a new credential "
+                                + "is issued."
+                                + System.lineSeparator());
+    }
+
+    @Test
+    void unnecessaryForceLastRevokesWithoutZeroKeyWarning()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+        UUID siblingId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            siblingId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+
+        Result result = invoke(projectId, targetId, true);
+
+        // One sibling remains active despite the force flag.
+        assertThat(revokedAt(targetId))
+                .as("stderr: %s", result.stderr())
+                .isNotNull();
+
+        assertThat(revokedAt(siblingId))
+                .as("stderr: %s", result.stderr())
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("stderr: %s", result.stderr())
+                .isEqualTo(1);
+
+        assertThat(result.exitCode()).isZero();
+        assertThat(result.stdout()).isEmpty();
+
+        // Exactly one receipt line: no zero-key WARNING.
+        assertThat(result.stderr())
+                .isEqualTo(
+                        "Credential " + targetId
+                                + " revoked for project " + projectId
+                                + " (name=revoke-project)."
+                                + System.lineSeparator());
+    }
+
     private Result invoke(
             UUID projectId, UUID credentialId, boolean forceLast) {
 
@@ -432,6 +536,33 @@ class CredentialAdminRevokeTests {
                 UUID id = rows.getObject(1, UUID.class);
                 assertThat(rows.next()).isFalse();
                 return id;
+            }
+        }
+    }
+
+    private long activeCredentialCount(UUID projectId)
+            throws SQLException {
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT count(*)
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                long count = rows.getLong(1);
+
+                assertThat(rows.next()).isFalse();
+
+                return count;
             }
         }
     }
