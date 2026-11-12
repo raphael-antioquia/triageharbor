@@ -6,11 +6,14 @@ import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Statement;
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -18,10 +21,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -668,6 +674,358 @@ class CredentialAdminRevokeTests {
                     10, TimeUnit.SECONDS)) {
                 executor.shutdownNow();
             }
+        }
+    }
+
+    @Test
+    @Timeout(value = 60, unit = TimeUnit.SECONDS)
+    void concurrentRevokesOfLastTwoCredentialsLeaveOneActive()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID firstCredentialId;
+        UUID secondCredentialId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            firstCredentialId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            secondCredentialId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+
+        CountDownLatch firstReachedUpdate = new CountDownLatch(1);
+        CountDownLatch releaseFirst = new CountDownLatch(1);
+        CountDownLatch secondConnected = new CountDownLatch(1);
+
+        AtomicInteger firstPid = new AtomicInteger();
+        AtomicInteger secondPid = new AtomicInteger();
+        AtomicInteger hookCalls = new AtomicInteger();
+
+        AtomicReference<String> firstIsolation =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener firstOpener =
+                (url, username, password) ->
+                        pauseBeforeCredentialUpdate(
+                                openWithBackendPid(
+                                        url, username, password, firstPid),
+                                hookCalls,
+                                firstIsolation,
+                                firstReachedUpdate,
+                                releaseFirst);
+
+        CredentialAdmin.ConnectionOpener secondOpener =
+                (url, username, password) -> {
+                    Connection actual = openWithBackendPid(
+                            url, username, password, secondPid);
+
+                    secondConnected.countDown();
+                    return actual;
+                };
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+
+        boolean secondBlockedByFirst = false;
+        Result firstResult;
+        Result secondResult;
+
+        try {
+            // A holds the project lock, has counted two keys,
+            // and pauses before its UPDATE.
+            Future<Result> first = executor.submit(
+                    () -> invokeWithOpener(
+                            projectId, firstCredentialId, firstOpener));
+
+            assertThat(firstReachedUpdate.await(15, TimeUnit.SECONDS))
+                    .as("First revoke must reach its UPDATE")
+                    .isTrue();
+
+            // B attempts to revoke the other active credential.
+            Future<Result> second = executor.submit(
+                    () -> invokeWithOpener(
+                            projectId, secondCredentialId, secondOpener));
+
+            assertThat(secondConnected.await(15, TimeUnit.SECONDS))
+                    .as("Second revoke must open its connection")
+                    .isTrue();
+
+            // Record instead of asserting here: the outcome
+            // must remain the primary concurrency evidence.
+            // Keep this short because B has a 5-second lock timeout.
+            secondBlockedByFirst = waitForProjectLockBlock(
+                    secondPid.get(), firstPid.get());
+
+            // A can now UPDATE and COMMIT. B then resumes.
+            releaseFirst.countDown();
+
+            firstResult = first.get(12, TimeUnit.SECONDS);
+            secondResult = second.get(12, TimeUnit.SECONDS);
+
+        } finally {
+            // Release A even if observation or an assertion fails.
+            releaseFirst.countDown();
+
+            executor.shutdown();
+
+            if (!executor.awaitTermination(
+                    10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        }
+
+        String mechanism = "blocked=" + secondBlockedByFirst
+                + ", isolation=" + firstIsolation.get()
+                + ", hookCalls=" + hookCalls.get()
+                + ", firstPid=" + firstPid.get()
+                + ", secondPid=" + secondPid.get();
+
+        // PRIMARY EVIDENCE: committed state from separate sessions.
+        assertThat(revokedAt(firstCredentialId))
+                .as("First credential must be revoked; %s", mechanism)
+                .isNotNull();
+
+        assertThat(revokedAt(secondCredentialId))
+                .as("Second credential must remain active; %s", mechanism)
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("Unforced revokes must leave one key; %s", mechanism)
+                .isEqualTo(1);
+
+        // SECONDARY EVIDENCE: exact operator contract.
+        assertThat(firstResult.exitCode())
+                .as("First revoke must succeed; %s", mechanism)
+                .isZero();
+
+        assertThat(firstResult.stdout()).isEmpty();
+
+        assertThat(firstResult.stderr())
+                .isEqualTo(
+                        "Credential " + firstCredentialId
+                                + " revoked for project " + projectId
+                                + " (name=revoke-project)."
+                                + System.lineSeparator());
+
+        assertThat(secondResult.exitCode())
+                .as("Second revoke must reject the final key; %s", mechanism)
+                .isEqualTo(1);
+
+        assertThat(secondResult.stdout()).isEmpty();
+
+        assertThat(secondResult.stderr())
+                .isEqualTo(
+                        "Credential " + secondCredentialId
+                                + " is the last active credential for project "
+                                + projectId
+                                + ". Issue a replacement credential first, or re-run "
+                                + "with --force-last to leave the project without an "
+                                + "active credential. No credential was revoked."
+                                + System.lineSeparator());
+
+        // MECHANISM EVIDENCE: checked after committed state.
+        assertThat(hookCalls.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(firstIsolation.get())
+                .as(mechanism)
+                .isEqualTo("read committed");
+
+        assertThat(firstPid.get()).isPositive();
+        assertThat(secondPid.get()).isPositive();
+        assertThat(secondPid.get()).isNotEqualTo(firstPid.get());
+
+        assertThat(secondBlockedByFirst)
+                .as("Backend %s must wait on backend %s's project-row lock",
+                        secondPid.get(), firstPid.get())
+                .isTrue();
+    }
+
+    private Result invokeWithOpener(
+            UUID projectId,
+            UUID credentialId,
+            CredentialAdmin.ConnectionOpener opener) {
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out = new PrintStream(
+                        stdout, true, StandardCharsets.UTF_8);
+                PrintStream err = new PrintStream(
+                        stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    new String[] {
+                        "revoke",
+                        "--project", projectId.toString(),
+                        "--credential", credentialId.toString()
+                    },
+                    environment(),
+                    out,
+                    err,
+                    opener);
+        }
+
+        return new Result(
+                exitCode,
+                stdout.toString(StandardCharsets.UTF_8),
+                stderr.toString(StandardCharsets.UTF_8));
+    }
+
+    private Connection openWithBackendPid(
+            String url,
+            String username,
+            String password,
+            AtomicInteger backendPid) throws SQLException {
+
+        Connection actual =
+                DriverManager.getConnection(url, username, password);
+
+        try {
+            try (PreparedStatement statement =
+                            actual.prepareStatement(
+                                    "SELECT pg_backend_pid()");
+                    ResultSet rows = statement.executeQuery()) {
+
+                if (!rows.next()) {
+                    throw new SQLException(
+                            "PostgreSQL backend PID unavailable",
+                            "XX000");
+                }
+
+                backendPid.set(rows.getInt(1));
+
+                if (rows.next()) {
+                    throw new SQLException(
+                            "Unexpected backend PID result",
+                            "XX000");
+                }
+            }
+
+            return actual;
+
+        } catch (SQLException | RuntimeException exception) {
+            try {
+                actual.close();
+            } catch (SQLException closeFailure) {
+                exception.addSuppressed(closeFailure);
+            }
+
+            throw exception;
+        }
+    }
+
+    private Connection pauseBeforeCredentialUpdate(
+            Connection actual,
+            AtomicInteger hookCalls,
+            AtomicReference<String> isolation,
+            CountDownLatch reachedUpdate,
+            CountDownLatch releaseUpdate) {
+
+        return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                (proxy, method, arguments) -> {
+
+                    if ("prepareStatement".equals(method.getName())
+                            && arguments != null
+                            && arguments.length > 0
+                            && arguments[0] instanceof String sql
+                            && sql.contains(
+                                    "UPDATE project_ingest_credentials")
+                            && sql.contains(
+                                    "SET revoked_at = now()")) {
+
+                        hookCalls.incrementAndGet();
+
+                        // Inspect isolation on A's actual connection,
+                        // inside the transaction after the count.
+                        try (Statement show = actual.createStatement();
+                                ResultSet rows = show.executeQuery(
+                                        "SHOW transaction_isolation")) {
+
+                            isolation.set(
+                                    rows.next() ? rows.getString(1) : null);
+                        }
+
+                        // Signal that A has passed its last-key guard.
+                        reachedUpdate.countDown();
+
+                        try {
+                            if (!releaseUpdate.await(
+                                    20, TimeUnit.SECONDS)) {
+                                throw new SQLException(
+                                        "First revoke test gate timed out",
+                                        "57014");
+                            }
+                        } catch (InterruptedException exception) {
+                            Thread.currentThread().interrupt();
+
+                            throw new SQLException(
+                                    "First revoke test gate interrupted",
+                                    "57014",
+                                    exception);
+                        }
+                    }
+
+                    try {
+                        return method.invoke(actual, arguments);
+                    } catch (InvocationTargetException exception) {
+                        // Preserve the original JDBC exception.
+                        throw exception.getCause();
+                    }
+                });
+    }
+
+    private boolean waitForProjectLockBlock(
+            int blockedPid, int blockingPid)
+            throws SQLException, InterruptedException {
+
+        // Leave a margin below production's 5s lock_timeout.
+        long deadline =
+                System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+
+        // Keep autocommit enabled so each observation is fresh.
+        try (Connection observer = migratorConnection();
+                PreparedStatement check = observer.prepareStatement(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_stat_activity
+                            WHERE pid = ?
+                              AND wait_event_type = 'Lock'
+                              AND ? = ANY(pg_blocking_pids(pid))
+                              AND query LIKE '%FOR NO KEY UPDATE%'
+                        )
+                        """)) {
+
+            check.setInt(1, blockedPid);
+            check.setInt(2, blockingPid);
+
+            while (System.nanoTime() < deadline) {
+                try (ResultSet rows = check.executeQuery()) {
+                    if (rows.next() && rows.getBoolean(1)) {
+                        return true;
+                    }
+                }
+
+                Thread.sleep(25);
+            }
+
+            return false;
         }
     }
 
