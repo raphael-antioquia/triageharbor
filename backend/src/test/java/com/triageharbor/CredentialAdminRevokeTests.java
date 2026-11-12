@@ -18,7 +18,12 @@ import java.time.format.DateTimeFormatter;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.context.annotation.Import;
@@ -552,6 +557,118 @@ class CredentialAdminRevokeTests {
                                 + " revoked for project " + projectId
                                 + " (name=revoke-project)."
                                 + System.lineSeparator());
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void revokeTimesOutOnHeldProjectLockWithoutChangingCredentials()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+        UUID siblingId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            siblingId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        // Two active keys: the last-key guard cannot reject this revoke.
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+
+        ExecutorService executor =
+                Executors.newSingleThreadExecutor();
+
+        try (Connection lockHolder = migratorConnection()) {
+            lockHolder.setAutoCommit(false);
+
+            try {
+                // Hold the same project-row lock revoke needs.
+                try (PreparedStatement statement =
+                        lockHolder.prepareStatement(
+                                """
+                                SELECT id
+                                FROM projects
+                                WHERE id = ?
+                                FOR NO KEY UPDATE
+                                """)) {
+
+                    statement.setObject(1, projectId);
+
+                    try (ResultSet rows = statement.executeQuery()) {
+                        assertThat(rows.next()).isTrue();
+
+                        assertThat(rows.getObject(1, UUID.class))
+                                .isEqualTo(projectId);
+
+                        assertThat(rows.next()).isFalse();
+                    }
+                }
+
+                // Autocommit is off, so the lock remains held.
+                long startedAt = System.nanoTime();
+
+                Future<Result> pending =
+                        executor.submit(
+                                () -> invoke(projectId, targetId, false));
+
+                // Fail independently if PostgreSQL does not return.
+                Result result = pending.get(15, TimeUnit.SECONDS);
+
+                long elapsedMillis =
+                        TimeUnit.NANOSECONDS.toMillis(
+                                System.nanoTime() - startedAt);
+
+                // Committed state first, from separate sessions.
+                assertThat(revokedAt(targetId))
+                        .as("Target must remain active")
+                        .isNull();
+
+                assertThat(revokedAt(siblingId))
+                        .as("Sibling must remain active")
+                        .isNull();
+
+                assertThat(result.exitCode()).isEqualTo(1);
+                assertThat(result.stdout()).isEmpty();
+
+                assertThat(result.stderr())
+                        .isEqualTo(
+                                "Credential revocation failed "
+                                        + "(SQLState 55P03). "
+                                        + "No change was committed."
+                                        + System.lineSeparator());
+
+                // Waited for lock_timeout rather than failing fast.
+                assertThat(elapsedMillis)
+                        .isBetween(3500L, 14999L);
+
+            } finally {
+                // Release the project lock even if the worker
+                // times out or an assertion fails.
+                lockHolder.rollback();
+            }
+
+        } finally {
+            executor.shutdown();
+
+            // Allow a previously blocked worker to finish
+            // after the lock-holder transaction is released.
+            if (!executor.awaitTermination(
+                    10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        }
     }
 
     private Result invoke(
