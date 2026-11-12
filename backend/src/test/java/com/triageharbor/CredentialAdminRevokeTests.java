@@ -852,6 +852,205 @@ class CredentialAdminRevokeTests {
                 .isTrue();
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void revokeDoesNotOverwriteOutOfBandRevocation()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+        UUID siblingId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            siblingId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+        assertThat(revokedAt(targetId)).isNull();
+        assertThat(revokedAt(siblingId)).isNull();
+
+        // Fixed timestamp distinguishes the external write
+        // from any later CLI overwrite using now().
+        OffsetDateTime externalRevokedAt =
+                OffsetDateTime.parse("2020-01-02T03:04:05.123456Z");
+
+        AtomicInteger hookCalls = new AtomicInteger();
+        AtomicInteger externalRows = new AtomicInteger();
+
+        AtomicReference<String> lockProbeState =
+                new AtomicReference<>();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (url, username, password) -> {
+
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    url, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+
+                                if ("prepareStatement".equals(
+                                                method.getName())
+                                        && arguments != null
+                                        && arguments.length > 0
+                                        && arguments[0] instanceof String sql
+                                        && sql.contains(
+                                                "UPDATE project_ingest_credentials")
+                                        && sql.contains(
+                                                "SET revoked_at = now()")) {
+
+                                    hookCalls.incrementAndGet();
+
+                                    // The CLI has acquired the project
+                                    // lock and passed its last-key guard.
+                                    // Independently probe that lock.
+                                    try (Connection probe =
+                                                    migratorConnection();
+                                            PreparedStatement lock =
+                                                    probe.prepareStatement(
+                                                            """
+                                                            SELECT id
+                                                            FROM projects
+                                                            WHERE id = ?
+                                                            FOR NO KEY UPDATE NOWAIT
+                                                            """)) {
+
+                                        lock.setObject(1, projectId);
+
+                                        try (ResultSet rows =
+                                                lock.executeQuery()) {
+
+                                            lockProbeState.set(
+                                                    rows.next()
+                                                            ? "lock acquired"
+                                                            : "project missing");
+                                        }
+
+                                    } catch (SQLException exception) {
+                                        lockProbeState.set(
+                                                exception.getSQLState());
+                                    }
+
+                                    // Deliberately bypass the operator's
+                                    // project-lock protocol. Only the
+                                    // credential row is updated.
+                                    //
+                                    // Autocommit makes the external
+                                    // mutation visible before CLI resumes.
+                                    try (Connection external =
+                                                    migratorConnection();
+                                            PreparedStatement update =
+                                                    external.prepareStatement(
+                                                            """
+                                                            UPDATE project_ingest_credentials
+                                                            SET revoked_at = ?
+                                                            WHERE id = ?
+                                                              AND project_id = ?
+                                                              AND revoked_at IS NULL
+                                                            """)) {
+
+                                        update.setQueryTimeout(3);
+                                        update.setObject(
+                                                1, externalRevokedAt);
+                                        update.setObject(2, targetId);
+                                        update.setObject(3, projectId);
+
+                                        externalRows.set(
+                                                update.executeUpdate());
+                                    }
+                                }
+
+                                try {
+                                    return method.invoke(
+                                            actual, arguments);
+                                } catch (
+                                        InvocationTargetException exception) {
+
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        Result result;
+
+        try {
+            result = invokeWithOpener(
+                    projectId, targetId, opener);
+
+        } finally {
+            // Do not leak the real JDBC connection if
+            // an injected failure bypasses normal cleanup.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+
+        String mechanism =
+                "hookCalls=" + hookCalls.get()
+                        + ", externalRows=" + externalRows.get()
+                        + ", lockProbe=" + lockProbeState.get();
+
+        // PRIMARY: independent committed database state.
+        // The CLI must not overwrite the external revocation.
+        assertThat(revokedAt(targetId))
+                .as("External revocation timestamp must survive; %s",
+                        mechanism)
+                .isEqualTo(externalRevokedAt);
+
+        assertThat(revokedAt(siblingId))
+                .as("Sibling must remain active; %s", mechanism)
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("Exactly one credential must remain; %s",
+                        mechanism)
+                .isEqualTo(1);
+
+        // SECONDARY: the CLI must not report a successful revoke.
+        assertThat(result.exitCode())
+                .as("Zero-row UPDATE must fail; %s", mechanism)
+                .isEqualTo(1);
+
+        assertThat(result.stdout()).isEmpty();
+
+        assertThat(result.stderr())
+                .isEqualTo(
+                        "Credential revocation failed "
+                                + "(SQLState XX000). "
+                                + "No change was committed."
+                                + System.lineSeparator());
+
+        // MECHANISM: the race occurred at the
+        // conditional UPDATE boundary.
+        assertThat(hookCalls.get()).isEqualTo(1);
+        assertThat(externalRows.get()).isEqualTo(1);
+
+        // The project lock was still held by the CLI.
+        assertThat(lockProbeState.get()).isEqualTo("55P03");
+    }
+
     private Result invokeWithOpener(
             UUID projectId,
             UUID credentialId,
