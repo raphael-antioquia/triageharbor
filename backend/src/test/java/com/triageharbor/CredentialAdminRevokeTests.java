@@ -1276,6 +1276,489 @@ class CredentialAdminRevokeTests {
                 .isEqualTo("55P03");
     }
 
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void revokeCommitSucceedsButAcknowledgmentIsLost()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(1);
+        assertThat(revokedAt(targetId)).isNull();
+
+        AtomicInteger commitCalls = new AtomicInteger();
+        AtomicInteger successfulCommits = new AtomicInteger();
+        AtomicInteger rollbackCalls = new AtomicInteger();
+        AtomicInteger rollbackFailures = new AtomicInteger();
+        AtomicInteger closeCalls = new AtomicInteger();
+
+        AtomicReference<SQLException> commitException =
+                new AtomicReference<>();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (url, username, password) -> {
+
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    url, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitCalls.incrementAndGet();
+
+                                    // The real PostgreSQL COMMIT succeeds.
+                                    try {
+                                        method.invoke(actual, arguments);
+                                    } catch (
+                                            InvocationTargetException exception) {
+                                        throw exception.getCause();
+                                    }
+
+                                    successfulCommits.incrementAndGet();
+
+                                    // Simulate losing the acknowledgment
+                                    // when the connection becomes unusable.
+                                    actual.close();
+
+                                    SQLException lostAcknowledgment =
+                                            new SQLException(
+                                                    "Synthetic lost acknowledgment",
+                                                    "08006");
+
+                                    commitException.set(
+                                            lostAcknowledgment);
+
+                                    throw lostAcknowledgment;
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackCalls.incrementAndGet();
+
+                                    // Forward rollback to the closed
+                                    // physical connection. It should fail.
+                                    try {
+                                        return method.invoke(
+                                                actual, arguments);
+                                    } catch (
+                                            InvocationTargetException exception) {
+
+                                        rollbackFailures.incrementAndGet();
+                                        throw exception.getCause();
+                                    }
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeCalls.incrementAndGet();
+
+                                    // The physical connection was already
+                                    // closed after COMMIT. Inject a
+                                    // cleanup error to verify suppression.
+                                    throw new SQLException(
+                                            "Synthetic close failure",
+                                            "08003");
+                                }
+
+                                try {
+                                    return method.invoke(
+                                            actual, arguments);
+                                } catch (
+                                        InvocationTargetException exception) {
+
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        Result first;
+
+        try {
+            ByteArrayOutputStream stdout =
+                    new ByteArrayOutputStream();
+
+            ByteArrayOutputStream stderr =
+                    new ByteArrayOutputStream();
+
+            int exitCode;
+
+            try (PrintStream out = new PrintStream(
+                            stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err = new PrintStream(
+                            stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        new String[] {
+                            "revoke",
+                            "--project", projectId.toString(),
+                            "--credential", targetId.toString(),
+                            "--force-last"
+                        },
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            first = new Result(
+                    exitCode,
+                    stdout.toString(StandardCharsets.UTF_8),
+                    stderr.toString(StandardCharsets.UTF_8));
+
+        } finally {
+            // Avoid leaking the physical connection if an
+            // unexpected failure occurs before cleanup.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+
+        String mechanism =
+                "commitCalls=" + commitCalls.get()
+                        + ", successfulCommits="
+                        + successfulCommits.get()
+                        + ", rollbackCalls=" + rollbackCalls.get()
+                        + ", rollbackFailures="
+                        + rollbackFailures.get()
+                        + ", closeCalls=" + closeCalls.get()
+                        + ", firstExit=" + first.exitCode()
+                        + ", firstStderr=" + first.stderr().strip();
+
+        // PRIMARY: PostgreSQL committed the revocation,
+        // despite the synthetic acknowledgment failure.
+        OffsetDateTime originalRevokedAt = revokedAt(targetId);
+
+        assertThat(originalRevokedAt)
+                .as("Revocation must be committed; %s", mechanism)
+                .isNotNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("Forced revoke must leave zero active keys; %s",
+                        mechanism)
+                .isZero();
+
+        // SECONDARY: no false success or definite rollback claim.
+        assertThat(first.exitCode())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(first.stdout()).isEmpty();
+
+        assertThat(first.stderr())
+                .as(mechanism)
+                .isEqualTo(
+                        "Revocation commit outcome uncertain for credential "
+                                + targetId
+                                + " (SQLState 08006). "
+                                + "The credential may still be active. "
+                                + "Re-run the identical revoke command, "
+                                + "including --force-last. "
+                                + "If the revocation committed, project "
+                                + projectId
+                                + " has no active credential."
+                                + System.lineSeparator());
+
+        // MECHANISM: COMMIT succeeded before the failure.
+        assertThat(commitCalls.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(successfulCommits.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(underlyingConnection.get()).isNotNull();
+
+        assertThat(underlyingConnection.get().isClosed())
+                .isTrue();
+
+        // Both cleanup attempts must occur and fail.
+        assertThat(rollbackCalls.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(rollbackFailures.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(closeCalls.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        // Both cleanup failures must be suppressed onto
+        // the ORIGINAL commit exception, not replace it.
+        SQLException originalError = commitException.get();
+
+        assertThat((Throwable) originalError).isNotNull();
+
+        assertThat(originalError.getSQLState())
+                .isEqualTo("08006");
+
+        assertThat(originalError.getSuppressed())
+                .as("Rollback and close errors must be suppressed")
+                .hasSize(2);
+
+        assertThat(originalError.getSuppressed()[0])
+                .isInstanceOf(SQLException.class);
+
+        assertThat(originalError.getSuppressed()[1])
+                .isInstanceOf(SQLException.class);
+
+        // RECOVERY: retry the identical command, including
+        // the original --force-last flag.
+        Result retry = invoke(projectId, targetId, true);
+
+        // Already-revoked success must preserve the timestamp.
+        assertThat(revokedAt(targetId))
+                .as("Retry must preserve original timestamp")
+                .isEqualTo(originalRevokedAt);
+
+        assertThat(activeCredentialCount(projectId)).isZero();
+
+        assertThat(retry.exitCode())
+                .as("retry stderr: %s", retry.stderr())
+                .isZero();
+
+        assertThat(retry.stdout()).isEmpty();
+
+        // No second zero-key warning on an idempotent retry.
+        assertThat(retry.stderr())
+                .isEqualTo(
+                        "Credential " + targetId
+                                + " already revoked at "
+                                + UTC_MICROS.format(
+                                        originalRevokedAt.toInstant())
+                                + " for project " + projectId
+                                + " (name=revoke-project). No change made."
+                                + System.lineSeparator());
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void revokeCommitInterceptedBeforeServerStillReportsUncertainty()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        UUID targetId;
+        UUID siblingId;
+
+        try (Connection connection = migratorConnection()) {
+            insertProject(connection, projectId);
+
+            targetId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+
+            siblingId = credentialId(
+                    connection,
+                    projectId,
+                    IngestCredentialFixtures.insertForProject(
+                            connection, projectId));
+        }
+
+        assertThat(activeCredentialCount(projectId)).isEqualTo(2);
+        assertThat(revokedAt(targetId)).isNull();
+        assertThat(revokedAt(siblingId)).isNull();
+
+        AtomicInteger commitAttempts = new AtomicInteger();
+        AtomicInteger rollbackAttempts = new AtomicInteger();
+        AtomicInteger closeAttempts = new AtomicInteger();
+
+        AtomicReference<Boolean> autoCommitAtCommit =
+                new AtomicReference<>();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (url, username, password) -> {
+
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    url, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempts.incrementAndGet();
+
+                                    autoCommitAtCommit.set(
+                                            actual.getAutoCommit());
+
+                                    // Do not forward COMMIT to PostgreSQL.
+                                    // The client still cannot know whether
+                                    // a real commit was received.
+                                    throw new SQLException(
+                                            "Synthetic intercepted COMMIT",
+                                            "40001");
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempts.incrementAndGet();
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeAttempts.incrementAndGet();
+                                }
+
+                                try {
+                                    return method.invoke(
+                                            actual, arguments);
+                                } catch (
+                                        InvocationTargetException exception) {
+
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        Result first;
+
+        try {
+            // No --force-last: two active credentials exist.
+            first = invokeWithOpener(
+                    projectId, targetId, opener);
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+
+        String mechanism =
+                "commitAttempts=" + commitAttempts.get()
+                        + ", rollbackAttempts="
+                        + rollbackAttempts.get()
+                        + ", closeAttempts=" + closeAttempts.get()
+                        + ", autoCommitAtCommit="
+                        + autoCommitAtCommit.get()
+                        + ", firstExit=" + first.exitCode()
+                        + ", firstStderr=" + first.stderr().strip();
+
+        // PRIMARY: COMMIT never reached the database.
+        // The CLI must have rolled back the pending UPDATE.
+        assertThat(revokedAt(targetId))
+                .as("Target must remain active; %s", mechanism)
+                .isNull();
+
+        assertThat(revokedAt(siblingId))
+                .as("Sibling must remain active; %s", mechanism)
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .as("Both credentials must remain active; %s",
+                        mechanism)
+                .isEqualTo(2);
+
+        // SECONDARY: even though this particular test knows
+        // COMMIT was intercepted, the CLI must report uncertainty.
+        assertThat(first.exitCode())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(first.stdout()).isEmpty();
+
+        assertThat(first.stderr())
+                .as(mechanism)
+                .isEqualTo(
+                        "Revocation commit outcome uncertain for credential "
+                                + targetId
+                                + " (SQLState 40001). "
+                                + "The credential may still be active. "
+                                + "Re-run the identical revoke command. "
+                                + "If the last-credential guard rejects "
+                                + "the retry, issue a replacement "
+                                + "credential, then revoke "
+                                + targetId + "."
+                                + System.lineSeparator());
+
+        // MECHANISM: one COMMIT attempt, never forwarded,
+        // followed by rollback and connection cleanup.
+        assertThat(commitAttempts.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(autoCommitAtCommit.get())
+                .as(mechanism)
+                .isEqualTo(false);
+
+        assertThat(rollbackAttempts.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(closeAttempts.get())
+                .as(mechanism)
+                .isEqualTo(1);
+
+        assertThat(underlyingConnection.get()).isNotNull();
+
+        assertThat(underlyingConnection.get().isClosed())
+                .isTrue();
+
+        // RECOVERY: retry the identical command.
+        // This time the target is still active, so the retry
+        // must perform the revocation rather than report
+        // an already-revoked success.
+        Result retry = invoke(projectId, targetId, false);
+
+        assertThat(revokedAt(targetId))
+                .as("Retry must revoke target")
+                .isNotNull();
+
+        assertThat(revokedAt(siblingId))
+                .as("Retry must preserve sibling")
+                .isNull();
+
+        assertThat(activeCredentialCount(projectId))
+                .isEqualTo(1);
+
+        assertThat(retry.exitCode())
+                .as("retry stderr: %s", retry.stderr())
+                .isZero();
+
+        assertThat(retry.stdout()).isEmpty();
+
+        assertThat(retry.stderr())
+                .isEqualTo(
+                        "Credential " + targetId
+                                + " revoked for project " + projectId
+                                + " (name=revoke-project)."
+                                + System.lineSeparator());
+    }
+
     private Result invokeWithOpener(
             UUID projectId,
             UUID credentialId,
