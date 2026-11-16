@@ -2,6 +2,7 @@ package com.triageharbor.event;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -10,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -35,7 +37,7 @@ class EventIngestPersistenceScrubbingTests {
     void cleanUpAsAdmin() throws SQLException {
         try (Connection admin = adminConnection();
                 Statement statement = admin.createStatement()) {
-            statement.execute("TRUNCATE TABLE events, incidents, projects");
+            statement.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
         }
     }
 
@@ -120,7 +122,7 @@ class EventIngestPersistenceScrubbingTests {
                                 "922f0af55a5c416555c2e8dc1cff07e4b3bb75c97f977f18b56fb938e3d87bf6");
 
                 assertThat(result.getInt("fingerprint_version"))
-                        .isEqualTo(1);
+                        .isEqualTo(EventFingerprintV2.VERSION);
 
                 assertThat(result.getLong("occurrence_count"))
                         .isEqualTo(1L);
@@ -177,7 +179,7 @@ class EventIngestPersistenceScrubbingTests {
                         .isEqualTo(
                                 "922f0af55a5c416555c2e8dc1cff07e4b3bb75c97f977f18b56fb938e3d87bf6");
 
-                assertThat(result.getInt("fingerprint_version")).isEqualTo(1);
+                assertThat(result.getInt("fingerprint_version")).isEqualTo(EventFingerprintV2.VERSION);
                 assertThat(result.getLong("occurrence_count")).isEqualTo(2L);
                 assertThat(result.next()).isFalse();
             }
@@ -265,7 +267,7 @@ class EventIngestPersistenceScrubbingTests {
                                 "493f566fc15dd6f7f667337837d50b8a74633cc70bcb730e0b80bb5a22f207f3");
 
                 assertThat(result.getInt("fingerprint_version"))
-                        .isEqualTo(1);
+                        .isEqualTo(EventFingerprintV2.VERSION);
 
                 assertThat(result.getLong("occurrence_count"))
                         .isEqualTo(1L);
@@ -275,6 +277,87 @@ class EventIngestPersistenceScrubbingTests {
 
                 assertThat(result.next()).isFalse();
             }
+        }
+    }
+
+    @Test
+    void credentialShapedSecretsAreScrubbedBeforePersistence()
+            throws SQLException {
+        String tokenA =
+                "th_AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        String tokenB =
+                "th_BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+
+        ProjectCredential project = insertProjectAsAdmin("Project A");
+
+        AuthenticatedProject authenticatedProject =
+                ingestCredentialResolver.resolve(project.ingestKey());
+
+        for (String token : List.of(tokenA, tokenB)) {
+            eventIngestService.ingest(
+                    authenticatedProject,
+                    new EventIngestRequest(
+                            Instant.parse("2026-01-01T10:00:00Z"),
+                            "SyntheticError " + token,
+                            "failure reported " + token,
+                            "at synthetic.Handler " + token));
+        }
+
+        try (Connection admin = adminConnection();
+                PreparedStatement statement =
+                        admin.prepareStatement(
+                                """
+                                SELECT
+                                    e.exception_type,
+                                    e.message,
+                                    e.stack_trace,
+                                    row_to_json(e)::text AS event_row_json,
+                                    i.title,
+                                    i.fingerprint_version,
+                                    i.occurrence_count,
+                                    row_to_json(i)::text AS incident_row_json
+                                FROM events e
+                                JOIN incidents i
+                                  ON i.project_id = e.project_id
+                                 AND i.id = e.incident_id
+                                WHERE e.project_id = ?
+                                """)) {
+
+            statement.setObject(1, project.projectId());
+
+            int eventCount = 0;
+
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next()) {
+                    eventCount++;
+
+                    assertThat(result.getString("exception_type"))
+                            .isEqualTo("SyntheticError [REDACTED]");
+
+                    assertThat(result.getString("message"))
+                            .isEqualTo("failure reported [REDACTED]");
+
+                    assertThat(result.getString("stack_trace"))
+                            .isEqualTo("at synthetic.Handler [REDACTED]");
+
+                    assertThat(result.getString("title"))
+                            .isEqualTo("SyntheticError [REDACTED]");
+
+                    assertThat(result.getInt("fingerprint_version"))
+                            .isEqualTo(EventFingerprintV2.VERSION);
+
+                    assertThat(result.getLong("occurrence_count"))
+                            .isEqualTo(2L);
+
+                    assertThat(result.getString("event_row_json"))
+                            .doesNotContain(tokenA, tokenB);
+
+                    assertThat(result.getString("incident_row_json"))
+                            .doesNotContain(tokenA, tokenB);
+                }
+            }
+
+            assertThat(eventCount).isEqualTo(2);
         }
     }
 
@@ -288,19 +371,18 @@ class EventIngestPersistenceScrubbingTests {
                                 """
                                 INSERT INTO projects (id, name)
                                 VALUES (?, ?)
-                                RETURNING ingest_key
                                 """)) {
 
             statement.setObject(1, projectId);
             statement.setString(2, name);
 
-            try (ResultSet result = statement.executeQuery()) {
-                assertThat(result.next()).isTrue();
+            assertThat(statement.executeUpdate()).isEqualTo(1);
 
-                return new ProjectCredential(
-                        projectId,
-                        result.getObject("ingest_key", UUID.class));
-            }
+            String ingestKey =
+                    IngestCredentialFixtures.insertForProject(
+                            admin, projectId);
+
+            return new ProjectCredential(projectId, ingestKey);
         }
     }
 
@@ -311,5 +393,5 @@ class EventIngestPersistenceScrubbingTests {
                 postgresContainer.getPassword());
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(UUID projectId, String ingestKey) {}
 }

@@ -30,6 +30,10 @@ final class SensitiveDataRedactor {
     private static final Pattern KEY_BOUNDARIES =
             Pattern.compile("[_.-]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])");
 
+    private static final Pattern INGEST_CREDENTIAL =
+            Pattern.compile(
+                    "th_(?=[a-z0-9_-]{0,42}+[A-Z])[A-Za-z0-9_-]{32,}+");
+
     private static final Set<String> SENSITIVE_SEGMENTS =
             Set.of(
                     "password",
@@ -53,8 +57,9 @@ final class SensitiveDataRedactor {
             return value;
         }
 
-        // Pass order affects fingerprint-v1 identity. Reordering requires version review.
-        return redactAssignments(redactJwt(redactUrlUserinfo(value)));
+        // Pass order defines fingerprint-v2 redaction semantics.
+        return redactIngestCredentialTokens(
+                redactAssignments(redactJwt(redactUrlUserinfo(value))));
     }
 
     private static String redactUrlUserinfo(String input) {
@@ -167,11 +172,18 @@ final class SensitiveDataRedactor {
                     || (previous.equals("api") && current.equals("key"))
                     || (previous.equals("access") && current.equals("key"))
                     || (previous.equals("private") && current.equals("key"))
+                    || (previous.equals("ingest") && current.equals("key"))
                     || (previous.equals("session") && current.equals("id"))) {
                 return true;
             }
             previous = current;
         }
         return false;
+    }
+
+    private static String redactIngestCredentialTokens(String input) {
+        return INGEST_CREDENTIAL
+                .matcher(input)
+                .replaceAll(Matcher.quoteReplacement(MARKER));
     }
 }

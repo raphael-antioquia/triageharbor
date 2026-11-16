@@ -50,7 +50,7 @@ class EventIngestFailureHandlerTests {
     @Test
     void resolverDatabaseFailureReturns500(CapturedOutput output)
             throws Exception {
-        UUID ingestKey = UUID.randomUUID();
+        String ingestKey = "th_" + "A".repeat(43);
         String canary = "CANARY_RESOLVER_DB_7a91";
 
         when(ingestCredentialResolver.resolve(ingestKey))
@@ -67,13 +67,13 @@ class EventIngestFailureHandlerTests {
         assertThat(output.getAll())
                 .contains("Database failure during POST /events: DataAccessResourceFailureException")
                 .doesNotContain(canary)
-                .doesNotContain(ingestKey.toString());
+                .doesNotContain(ingestKey);
     }
 
     @Test
     void writerDatabaseFailureReturns500(CapturedOutput output)
             throws Exception {
-        UUID ingestKey = UUID.randomUUID();
+        String ingestKey = "th_" + "A".repeat(43);
         String canary = "CANARY_WRITER_DB_84c2";
 
         UUID projectId = UUID.randomUUID();
@@ -99,13 +99,13 @@ class EventIngestFailureHandlerTests {
         assertThat(output.getAll())
                 .contains("Database failure during POST /events: DataIntegrityViolationException")
                 .doesNotContain(canary)
-                .doesNotContain(ingestKey.toString());
+                .doesNotContain(ingestKey);
     }
 
     @Test
     void transactionFailureDoesNotLeakMessageOrCause(CapturedOutput output)
             throws Exception {
-        UUID ingestKey = UUID.randomUUID();
+        String ingestKey = "th_" + "A".repeat(43);
 
         String messageCanary = "CANARY_TX_MESSAGE_38fa";
         String causeCanary = "CANARY_TX_CAUSE_92bd";
@@ -130,14 +130,14 @@ class EventIngestFailureHandlerTests {
         assertThat(response.body())
                 .doesNotContain(messageCanary)
                 .doesNotContain(causeCanary)
-                .doesNotContain(ingestKey.toString())
+                .doesNotContain(ingestKey)
                 .isEmpty();
 
         assertThat(output.getAll())
                 .contains("Database failure during POST /events: CannotCreateTransactionException")
                 .doesNotContain(messageCanary)
                 .doesNotContain(causeCanary)
-                .doesNotContain(ingestKey.toString());
+                .doesNotContain(ingestKey);
     }
 
     private double projectRejectionCount(UUID projectId) {
@@ -151,7 +151,7 @@ class EventIngestFailureHandlerTests {
         return counter == null ? 0.0 : counter.count();
     }
 
-    private HttpResponse<String> postEvents(UUID ingestKey)
+    private HttpResponse<String> postEvents(String ingestKey)
             throws Exception {
         HttpRequest request =
                 HttpRequest.newBuilder()
@@ -160,7 +160,7 @@ class EventIngestFailureHandlerTests {
                         .header("Content-Type", "application/json")
                         .header(
                                 EventIngestController.INGEST_KEY_HEADER,
-                                ingestKey.toString())
+                                ingestKey)
                         .POST(HttpRequest.BodyPublishers.ofString(
                                 """
                                 {

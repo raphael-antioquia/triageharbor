@@ -1,0 +1,2008 @@
+package com.triageharbor;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Base64;
+import java.util.HexFormat;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.context.annotation.Import;
+import org.testcontainers.postgresql.PostgreSQLContainer;
+
+@SpringBootTest
+@Import(RoleSeparatedPostgresTestConfiguration.class)
+class CredentialAdminIssueTests {
+
+    private static final String PASSWORD = "test-migrator-password";
+
+    @Autowired
+    private PostgreSQLContainer postgresContainer;
+
+    @Test
+    void issuePrintsCanonicalTokenOnlyAfterCommitAndStoresItsHash()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "issue-project");
+
+        CommitObservingOutputStream stdout =
+                new CommitObservingOutputStream(projectId);
+
+        CommitObservingOutputStream stderr =
+                new CommitObservingOutputStream(projectId);
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+        assertThat(stdout.firstWriteObserved()).isTrue();
+        assertThat(stdout.committedAtFirstWrite()).isTrue();
+
+        String output = stdout.content();
+        String token = output.stripTrailing();
+
+        assertThat(output).isEqualTo(token + System.lineSeparator());
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+
+        byte[] randomBytes =
+                Base64.getUrlDecoder().decode(token.substring(3));
+
+        assertThat(randomBytes).hasSize(32);
+
+        assertThat(
+                Base64.getUrlEncoder()
+                        .withoutPadding()
+                        .encodeToString(randomBytes))
+                .isEqualTo(token.substring(3));
+
+        byte[] expectedHash =
+                MessageDigest.getInstance("SHA-256")
+                        .digest(token.getBytes(StandardCharsets.UTF_8));
+
+        String hashHex = HexFormat.of().formatHex(expectedHash);
+        UUID credentialId;
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id, project_id, key_hash,
+                                       key_prefix, created_at, revoked_at
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject("id", UUID.class);
+
+                assertThat(rows.getObject("project_id", UUID.class))
+                        .isEqualTo(projectId);
+
+                assertThat(rows.getBytes("key_hash"))
+                        .containsExactly(expectedHash);
+
+                assertThat(rows.getString("key_prefix"))
+                        .isEqualTo(token.substring(0, 11));
+
+                assertThat(rows.getObject("created_at")).isNotNull();
+                assertThat(rows.getObject("revoked_at")).isNull();
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        assertThat(stderr.firstWriteObserved()).isTrue();
+        assertThat(stderr.committedAtFirstWrite()).isTrue();
+
+        String diagnostics = stderr.content();
+
+        assertThat(diagnostics)
+                .contains(
+                        projectId.toString(),
+                        credentialId.toString(),
+                        "issue-project")
+                .doesNotContain(token, hashHex);
+    }
+
+    @Test
+    void missingProjectDoesNotIssueCredential() throws Exception {
+        UUID missingProject = UUID.randomUUID();
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(missingProject),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        // The FK already prevents orphan rows; this message is what
+        // distinguishes an explicit existence check from a 23503 failure.
+        assertThat(exitCode).isEqualTo(1);
+        assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+        assertThat(stderr.toString(StandardCharsets.UTF_8))
+                .contains("Project not found.")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    void stdoutFailureAfterCommitReportsRecoveryWithoutToken()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "output-failure-project");
+
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        OutputStream failingOutput = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stdout failure");
+            }
+        };
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                failingOutput, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+
+            assertThat(out.checkError()).isTrue();
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+
+        UUID credentialId;
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject(1, UUID.class);
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        assertThat(diagnostics)
+                .contains(
+                        "Credential " + credentialId + " committed",
+                        "stdout",
+                        "issue a replacement",
+                        "revoke")
+                .doesNotContain("not committed", "rolled back")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    void repeatedIssueCreatesDistinctActiveCredentials()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "repeat-project");
+
+        String first = issueToken(projectId);
+        String second = issueToken(projectId);
+
+        assertThat(first).isNotEqualTo(second);
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT count(*), count(DISTINCT key_hash)
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+                assertThat(rows.getInt(1)).isEqualTo(2);
+                assertThat(rows.getInt(2)).isEqualTo(2);
+            }
+        }
+    }
+
+    @Test
+    void commitSucceedsButAcknowledgmentIsLost() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "lost-ack-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    // The actual database COMMIT succeeded.
+                                    // Simulate losing its acknowledgment.
+                                    if ("commit".equals(method.getName())) {
+                                        throw new SQLException(
+                                                "synthetic lost acknowledgment",
+                                                "08006");
+                                    }
+
+                                    return result;
+                                } catch (InvocationTargetException exception) {
+                                    // Preserve the original JDBC exception.
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+
+            UUID credentialId;
+
+            // Another connection must see the committed credential.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject(1, UUID.class);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "Commit outcome uncertain for credential "
+                                    + credentialId,
+                            "SQLState 08006",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke " + credentialId)
+                    .doesNotContain(
+                            "Credential " + credentialId + " committed",
+                            "synthetic lost acknowledgment",
+                            "No credential was issued")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            // Verify the documented recovery path with the real CLI.
+            ByteArrayOutputStream listStdout =
+                    new ByteArrayOutputStream();
+            ByteArrayOutputStream listStderr =
+                    new ByteArrayOutputStream();
+
+            int listExitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    listStdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    listStderr, true, StandardCharsets.UTF_8)) {
+
+                listExitCode = CredentialAdmin.run(
+                        new String[] {
+                            "list", "--project", projectId.toString()
+                        },
+                        environment(),
+                        out,
+                        err);
+            }
+
+            assertThat(listExitCode).isZero();
+
+            assertThat(listStdout.toString(StandardCharsets.UTF_8))
+                    .contains(credentialId.toString())
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(listStderr.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // Do not leak the real PostgreSQL connection if an
+            // assertion fails before the normal close check.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void commitInterceptedBeforeServerDoesNotPersistCredential()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "intercepted-commit-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicReference<Boolean> autoCommitAtCommit =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                    autoCommitAtCommit.set(
+                                            actual.getAutoCommit());
+
+                                    // Never forward COMMIT to PostgreSQL.
+                                    throw new SQLException(
+                                            "synthetic intercepted commit",
+                                            "08006");
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8)).isEmpty();
+
+            // Outcome first: an independent connection must see no
+            // credential after the intercepted COMMIT.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            // Mechanism second: explain why the outcome held.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(autoCommitAtCommit.get()).isEqualTo(false);
+            assertThat(rollbackAttempted.get()).isTrue();
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "SQLState 08006",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke ")
+                    .containsPattern(
+                            "Commit outcome uncertain for credential "
+                                    + "[0-9a-f]{8}-[0-9a-f]{4}-"
+                                    + "[0-9a-f]{4}-[0-9a-f]{4}-"
+                                    + "[0-9a-f]{12}")
+                    .doesNotContain(
+                            "No credential was issued",
+                            "synthetic intercepted commit")
+                    .doesNotContainPattern(
+                            "Credential [0-9a-f-]{36} committed")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // A failed assertion must not leak the real connection
+            // or leave a project-row lock open.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void connectionCloseFailureAfterCommitIsWarningOnly()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "close-failure-project");
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicReference<String> stdoutAtClose =
+                new AtomicReference<>();
+        AtomicReference<String> stderrAtClose =
+                new AtomicReference<>();
+
+        AtomicBoolean commitConfirmed = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    if ("commit".equals(methodName)) {
+                                        commitConfirmed.set(true);
+                                    }
+
+                                    if ("close".equals(methodName)) {
+                                        // Real connection is already closed.
+                                        // Capture output present at close.
+                                        stdoutAtClose.set(
+                                                stdout.toString(
+                                                        StandardCharsets.UTF_8));
+                                        stderrAtClose.set(
+                                                stderr.toString(
+                                                        StandardCharsets.UTF_8));
+
+                                        throw new SQLException(
+                                                "synthetic close failure",
+                                                "08006");
+                                    }
+
+                                    return result;
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isZero();
+            assertThat(commitConfirmed.get()).isTrue();
+
+            String output =
+                    stdout.toString(StandardCharsets.UTF_8);
+
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output)
+                    .isEqualTo(token + System.lineSeparator());
+
+            // Token must exist before connection.close().
+            assertThat(stdoutAtClose.get()).isEqualTo(output);
+
+            byte[] expectedHash =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(token.getBytes(StandardCharsets.UTF_8));
+
+            UUID credentialId;
+
+            // Independent database connection confirms persistence.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id, key_hash, key_prefix,
+                                           revoked_at
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject("id", UUID.class);
+
+                    assertThat(rows.getBytes("key_hash"))
+                            .containsExactly(expectedHash);
+
+                    assertThat(rows.getString("key_prefix"))
+                            .isEqualTo(token.substring(0, 11));
+
+                    assertThat(rows.getObject("revoked_at")).isNull();
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            String committedMetadata =
+                    "Credential " + credentialId
+                            + " committed for project " + projectId;
+
+            // Metadata precedes close; the warning follows close.
+            assertThat(stderrAtClose.get())
+                    .contains(committedMetadata)
+                    .doesNotContain(
+                            "database connection cleanup failed");
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            committedMetadata,
+                            "Credential " + credentialId
+                                    + " committed; database connection "
+                                    + "cleanup failed (SQLState 08006).")
+                    .doesNotContain(
+                            token,
+                            "synthetic close failure",
+                            "No credential was issued")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            // Close underlying JDBC connection if an assertion fails.
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void rollbackFailurePreservesOriginalMissingProjectError()
+            throws Exception {
+
+        UUID missingProject = UUID.randomUUID();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicBoolean closeAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+
+                                    // Fail before forwarding rollback.
+                                    throw new SQLException(
+                                            "synthetic rollback failure",
+                                            "08006");
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(missingProject),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            // The original failure stays authoritative.
+            assertThat(diagnostics)
+                    .isEqualTo(
+                            "Project not found. No credential was issued."
+                                    + System.lineSeparator());
+
+            assertThat(diagnostics)
+                    .doesNotContain(
+                            "synthetic rollback failure",
+                            "SQLState 08006",
+                            "Commit outcome uncertain")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(rollbackAttempted.get()).isTrue();
+            assertThat(closeAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void deadConnectionAfterCommitKeepsUncertainOutcomeAndOriginalSqlState()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "dead-connection-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+        AtomicBoolean closeAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+
+                                    // Simulated unavailable connection.
+                                    throw new SQLException(
+                                            "synthetic dead connection",
+                                            "08003");
+                                }
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("close".equals(methodName)) {
+                                    closeAttempted.set(true);
+                                }
+
+                                try {
+                                    Object result =
+                                            method.invoke(actual, arguments);
+
+                                    if ("commit".equals(methodName)) {
+                                        // The real COMMIT succeeded.
+                                        // The acknowledgment is lost.
+                                        throw new SQLException(
+                                                "synthetic lost acknowledgment",
+                                                "08006");
+                                    }
+
+                                    if ("close".equals(methodName)) {
+                                        // The real connection is closed.
+                                        // Its acknowledgment also fails.
+                                        throw new SQLException(
+                                                "synthetic dead connection",
+                                                "08003");
+                                    }
+
+                                    return result;
+
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            UUID credentialId;
+
+            // Outcome first: COMMIT actually succeeded.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT id
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    credentialId = rows.getObject(1, UUID.class);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            // COMMIT's original SQLState must remain authoritative.
+            String diagnostics =
+                    stderr.toString(StandardCharsets.UTF_8);
+
+            assertThat(diagnostics)
+                    .contains(
+                            "Commit outcome uncertain for credential "
+                                    + credentialId,
+                            "(SQLState 08006)",
+                            "Run list for project " + projectId,
+                            "issue a replacement credential",
+                            "then revoke " + credentialId)
+                    .doesNotContain(
+                            "SQLState 08003",
+                            "No credential was issued",
+                            "Credential " + credentialId + " committed",
+                            "synthetic")
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            // Confirm all three injected failure paths executed.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(rollbackAttempted.get()).isTrue();
+            assertThat(closeAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void brokenStderrBeforeCommitPreventsIssuance() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "broken-stderr-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        OutputStream brokenStderr = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stderr failure");
+            }
+        };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    brokenStderr, true, StandardCharsets.UTF_8)) {
+
+                // Prime the sticky error state before issuance.
+                err.print('x');
+                assertThat(err.checkError()).isTrue();
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+
+            // Outcome first: no credential may survive.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            assertThat(stdout.toString(StandardCharsets.UTF_8))
+                    .isEmpty();
+
+            // Mechanism second: rollback, never COMMIT.
+            assertThat(commitAttempted.get()).isFalse();
+            assertThat(rollbackAttempted.get()).isTrue();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void stderrFailureAfterCommitStillDeliversToken() throws Exception {
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "late-stderr-failure-project");
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicBoolean commitAttempted = new AtomicBoolean();
+        AtomicBoolean rollbackAttempted = new AtomicBoolean();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("commit".equals(methodName)) {
+                                    commitAttempted.set(true);
+                                }
+
+                                if ("rollback".equals(methodName)) {
+                                    rollbackAttempted.set(true);
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        // Unlike Test 5, do not prime this failing stream.
+        OutputStream brokenStderr = new OutputStream() {
+            @Override
+            public void write(int value) throws IOException {
+                throw new IOException("Synthetic stderr failure");
+            }
+        };
+
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    brokenStderr, true, StandardCharsets.UTF_8)) {
+
+                assertThat(err.checkError()).isFalse();
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+
+                assertThat(err.checkError()).isTrue();
+            }
+
+            assertThat(exitCode).isEqualTo(1);
+
+            byte[] storedHash;
+
+            // Outcome first: the credential really committed.
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT key_hash
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    storedHash = rows.getBytes(1);
+
+                    assertThat(rows.next()).isFalse();
+                }
+            }
+
+            // The token must still be delivered exactly once.
+            String output = stdout.toString(StandardCharsets.UTF_8);
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output).isEqualTo(token + System.lineSeparator());
+
+            assertThat(storedHash)
+                    .containsExactly(
+                            MessageDigest.getInstance("SHA-256")
+                                    .digest(token.getBytes(
+                                            StandardCharsets.UTF_8)));
+
+            // Confirm COMMIT happened and rollback was never attempted.
+            assertThat(commitAttempted.get()).isTrue();
+            assertThat(rollbackAttempted.get()).isFalse();
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void partialStdoutFailureDoesNotRetryOrLeakToken()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "partial-stdout-project");
+
+        ByteArrayOutputStream acceptedBytes =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream offeredBytes =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        AtomicInteger tokenPrintAttempts = new AtomicInteger();
+        AtomicReference<String> offeredTokenLine =
+                new AtomicReference<>();
+
+        // Accept the first 20 bytes, then fail permanently.
+        OutputStream partialStdout = new OutputStream() {
+            private int acceptedCount;
+
+            @Override
+            public void write(int value) throws IOException {
+                offeredBytes.write(value);
+
+                if (acceptedCount == 20) {
+                    throw new IOException(
+                            "synthetic partial stdout failure");
+                }
+
+                acceptedBytes.write(value);
+                acceptedCount++;
+            }
+
+            @Override
+            public void write(
+                    byte[] bytes, int offset, int length)
+                    throws IOException {
+
+                offeredBytes.write(bytes, offset, length);
+
+                int allowed =
+                        Math.min(length, 20 - acceptedCount);
+
+                acceptedBytes.write(bytes, offset, allowed);
+                acceptedCount += allowed;
+
+                if (allowed < length) {
+                    throw new IOException(
+                            "synthetic partial stdout failure");
+                }
+            }
+        };
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                partialStdout,
+                                true,
+                                StandardCharsets.UTF_8) {
+
+                            @Override
+                            public void print(String value) {
+                                if (value.startsWith("th_")) {
+                                    tokenPrintAttempts.incrementAndGet();
+                                    offeredTokenLine.set(value);
+                                }
+
+                                super.print(value);
+                            }
+                        };
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+
+            assertThat(out.checkError()).isTrue();
+        }
+
+        assertThat(exitCode).isEqualTo(1);
+
+        UUID credentialId;
+        byte[] storedHash;
+
+        // Database outcome first: the credential was committed.
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                SELECT id, key_hash, key_prefix
+                                FROM project_ingest_credentials
+                                WHERE project_id = ?
+                                  AND revoked_at IS NULL
+                                """)) {
+
+            statement.setObject(1, projectId);
+
+            try (ResultSet rows = statement.executeQuery()) {
+                assertThat(rows.next()).isTrue();
+
+                credentialId = rows.getObject("id", UUID.class);
+                storedHash = rows.getBytes("key_hash");
+
+                assertThat(rows.next()).isFalse();
+            }
+        }
+
+        // Recover the intended token from the print argument,
+        // not from the 20 bytes accepted by the destination.
+        assertThat(offeredTokenLine.get()).isNotNull();
+
+        String offeredLine = offeredTokenLine.get();
+        String token = offeredLine.stripTrailing();
+
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+        assertThat(offeredLine)
+                .isEqualTo(token + System.lineSeparator());
+
+        assertThat(storedHash)
+                .containsExactly(
+                        MessageDigest.getInstance("SHA-256")
+                                .digest(token.getBytes(
+                                        StandardCharsets.UTF_8)));
+
+        // Exactly the first 20 bytes were accepted.
+        String accepted =
+                acceptedBytes.toString(StandardCharsets.UTF_8);
+
+        assertThat(acceptedBytes.size()).isEqualTo(20);
+        assertThat(accepted)
+                .isEqualTo(token.substring(0, 20));
+
+        // Strongest retry invariant first: the entire output
+        // offered to the destination is exactly one token line.
+        byte[] expectedLine =
+                (token + System.lineSeparator())
+                        .getBytes(StandardCharsets.UTF_8);
+
+        assertThat(offeredBytes.size())
+                .isEqualTo(expectedLine.length);
+
+        assertThat(MessageDigest.isEqual(
+                offeredBytes.toByteArray(), expectedLine))
+                .isTrue();
+
+        // Mechanism second: one application-level print call.
+        assertThat(tokenPrintAttempts.get()).isEqualTo(1);
+
+        // Recovery must not expose the token or its partial prefix.
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        assertThat(diagnostics)
+                .contains(
+                        "Credential " + credentialId + " committed",
+                        "stdout failed",
+                        "issue a replacement credential, then revoke "
+                                + credentialId)
+                .doesNotContain(
+                        token,
+                        accepted,
+                        "synthetic partial stdout failure",
+                        "No credential was issued")
+                .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+    }
+
+    @Test
+    @Timeout(value = 35, unit = TimeUnit.SECONDS)
+    void issueTimesOutOnHeldProjectLockWithoutPersisting()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "locked-project");
+
+        record IssueResult(
+                int exitCode, String stdout, String stderr) {}
+
+        ExecutorService executor =
+                Executors.newSingleThreadExecutor();
+
+        try (Connection lockHolder = migratorConnection()) {
+            lockHolder.setAutoCommit(false);
+
+            try {
+                // Hold the same project-row lock issuance needs.
+                try (PreparedStatement statement =
+                        lockHolder.prepareStatement(
+                                """
+                                SELECT id
+                                FROM projects
+                                WHERE id = ?
+                                FOR NO KEY UPDATE
+                                """)) {
+
+                    statement.setObject(1, projectId);
+
+                    try (ResultSet rows = statement.executeQuery()) {
+                        assertThat(rows.next()).isTrue();
+
+                        assertThat(rows.getObject(1, UUID.class))
+                                .isEqualTo(projectId);
+
+                        assertThat(rows.next()).isFalse();
+                    }
+                }
+
+                // Autocommit is off, so the lock remains held.
+                long startedAt = System.nanoTime();
+
+                Future<IssueResult> pending =
+                        executor.submit(() -> {
+                            ByteArrayOutputStream stdout =
+                                    new ByteArrayOutputStream();
+
+                            ByteArrayOutputStream stderr =
+                                    new ByteArrayOutputStream();
+
+                            int exitCode;
+
+                            try (PrintStream out =
+                                            new PrintStream(
+                                                    stdout,
+                                                    true,
+                                                    StandardCharsets.UTF_8);
+                                    PrintStream err =
+                                            new PrintStream(
+                                                    stderr,
+                                                    true,
+                                                    StandardCharsets.UTF_8)) {
+
+                                exitCode = CredentialAdmin.run(
+                                        issueArgs(projectId),
+                                        environment(),
+                                        out,
+                                        err);
+                            }
+
+                            return new IssueResult(
+                                    exitCode,
+                                    stdout.toString(
+                                            StandardCharsets.UTF_8),
+                                    stderr.toString(
+                                            StandardCharsets.UTF_8));
+                        });
+
+                // Fail independently if PostgreSQL does not return.
+                IssueResult result =
+                        pending.get(15, TimeUnit.SECONDS);
+
+                long elapsedMillis =
+                        TimeUnit.NANOSECONDS.toMillis(
+                                System.nanoTime() - startedAt);
+
+                // Observable operator outcome first.
+                assertThat(result.exitCode()).isEqualTo(1);
+                assertThat(result.stdout()).isEmpty();
+
+                assertThat(result.stderr())
+                        .contains(
+                                "SQLState 55P03",
+                                "No credential was issued.")
+                        .doesNotContain(
+                                "Commit outcome uncertain",
+                                "committed for project")
+                        .doesNotContainPattern(
+                                "th_[A-Za-z0-9_-]{43}");
+
+                // The configured 5-second timeout must apply.
+                assertThat(elapsedMillis)
+                        .isBetween(3500L, 14999L);
+
+                // Verify persistence independently.
+                try (Connection verification =
+                                migratorConnection();
+                        PreparedStatement statement =
+                                verification.prepareStatement(
+                                        """
+                                        SELECT count(*)
+                                        FROM project_ingest_credentials
+                                        WHERE project_id = ?
+                                        """)) {
+
+                    statement.setObject(1, projectId);
+
+                    try (ResultSet rows =
+                            statement.executeQuery()) {
+
+                        assertThat(rows.next()).isTrue();
+                        assertThat(rows.getLong(1)).isZero();
+                    }
+                }
+
+            } finally {
+                // Release the project lock even if the worker
+                // times out or an assertion fails.
+                lockHolder.rollback();
+            }
+
+        } finally {
+            executor.shutdown();
+
+            // Allow a previously blocked worker to finish
+            // after the lock-holder transaction is released.
+            if (!executor.awaitTermination(
+                    10, TimeUnit.SECONDS)) {
+                executor.shutdownNow();
+            }
+        }
+    }
+
+    @Test
+    @Timeout(value = 30, unit = TimeUnit.SECONDS)
+    void issuanceProjectLockAllowsNewIncidentInsert()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+        insertProject(projectId, "lock-compatibility-project");
+
+        // Force a new incident, not a conflict-update path.
+        String fingerprint = "lock-" + UUID.randomUUID();
+
+        AtomicReference<Connection> underlyingConnection =
+                new AtomicReference<>();
+
+        AtomicInteger probeCalls = new AtomicInteger();
+        AtomicInteger incidentRowsInserted = new AtomicInteger();
+
+        AtomicReference<String> lockObservation =
+                new AtomicReference<>();
+
+        AtomicReference<String> incidentFailureState =
+                new AtomicReference<>();
+
+        CredentialAdmin.ConnectionOpener opener =
+                (jdbcUrl, username, password) -> {
+                    Connection actual =
+                            DriverManager.getConnection(
+                                    jdbcUrl, username, password);
+
+                    underlyingConnection.set(actual);
+
+                    return (Connection) Proxy.newProxyInstance(
+                            Connection.class.getClassLoader(),
+                            new Class<?>[] {Connection.class},
+                            (proxy, method, arguments) -> {
+                                String methodName = method.getName();
+
+                                if ("prepareStatement".equals(methodName)
+                                        && arguments != null
+                                        && arguments.length > 0
+                                        && arguments[0] instanceof String sql
+                                        && sql.contains(
+                                                "INSERT INTO project_ingest_credentials")) {
+
+                                    // CredentialAdmin has completed its
+                                    // project SELECT ... FOR NO KEY UPDATE.
+                                    probeCalls.incrementAndGet();
+
+                                    // Precondition: a separate transaction
+                                    // cannot acquire that same row lock.
+                                    try (Connection observer =
+                                                    migratorConnection();
+                                            PreparedStatement probeLock =
+                                                    observer.prepareStatement(
+                                                            """
+                                                            SELECT id
+                                                            FROM projects
+                                                            WHERE id = ?
+                                                            FOR NO KEY UPDATE NOWAIT
+                                                            """)) {
+
+                                        probeLock.setObject(1, projectId);
+
+                                        try (ResultSet rows =
+                                                probeLock.executeQuery()) {
+
+                                            assertThat(rows.next()).isTrue();
+                                            assertThat(rows.next()).isFalse();
+                                        }
+
+                                        lockObservation.set("not locked");
+
+                                    } catch (SQLException exception) {
+                                        lockObservation.set(
+                                                exception.getSQLState());
+                                    }
+
+                                    // Attempt a new incident INSERT using
+                                    // the actual runtime database role.
+                                    try (Connection app =
+                                            DriverManager.getConnection(
+                                                    postgresContainer.getJdbcUrl(),
+                                                    "triageharbor_app",
+                                                    "test-app-password")) {
+
+                                        app.setAutoCommit(false);
+
+                                        try {
+                                            try (java.sql.Statement timeouts =
+                                                    app.createStatement()) {
+
+                                                // Short lock wait; the
+                                                // statement timeout is a
+                                                // separate safety backstop.
+                                                timeouts.execute(
+                                                        "SET LOCAL lock_timeout = '1s'");
+
+                                                timeouts.execute(
+                                                        "SET LOCAL statement_timeout = '3s'");
+                                            }
+
+                                            try (PreparedStatement incident =
+                                                    app.prepareStatement(
+                                                            """
+                                                            INSERT INTO incidents (
+                                                                project_id,
+                                                                fingerprint,
+                                                                fingerprint_version,
+                                                                title,
+                                                                first_seen_at,
+                                                                last_seen_at
+                                                            )
+                                                            VALUES (?, ?, 1, ?, now(), now())
+                                                            """)) {
+
+                                                incident.setObject(
+                                                        1, projectId);
+
+                                                incident.setString(
+                                                        2, fingerprint);
+
+                                                incident.setString(
+                                                        3,
+                                                        "Lock compatibility probe");
+
+                                                incidentRowsInserted.set(
+                                                        incident.executeUpdate());
+                                            }
+
+                                        } finally {
+                                            // Preserve isolation between
+                                            // tests: do not persist probe.
+                                            app.rollback();
+                                        }
+
+                                    } catch (SQLException exception) {
+                                        incidentFailureState.set(
+                                                exception.getSQLState());
+                                    }
+                                }
+
+                                try {
+                                    return method.invoke(actual, arguments);
+                                } catch (InvocationTargetException exception) {
+                                    throw exception.getCause();
+                                }
+                            });
+                };
+
+        ByteArrayOutputStream stdout =
+                new ByteArrayOutputStream();
+
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        try {
+            int exitCode;
+
+            try (PrintStream out =
+                            new PrintStream(
+                                    stdout, true, StandardCharsets.UTF_8);
+                    PrintStream err =
+                            new PrintStream(
+                                    stderr, true, StandardCharsets.UTF_8)) {
+
+                exitCode = CredentialAdmin.run(
+                        issueArgs(projectId),
+                        environment(),
+                        out,
+                        err,
+                        opener);
+            }
+
+            // The real credential issuance command succeeded.
+            assertThat(exitCode).isZero();
+
+            // First verify our interception and lock precondition.
+            assertThat(probeCalls.get()).isEqualTo(1);
+            assertThat(lockObservation.get()).isEqualTo("55P03");
+
+            // Then verify compatibility with incident creation.
+            assertThat(incidentFailureState.get()).isNull();
+            assertThat(incidentRowsInserted.get()).isEqualTo(1);
+
+            String output =
+                    stdout.toString(StandardCharsets.UTF_8);
+
+            String token = output.stripTrailing();
+
+            assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+            assertThat(output)
+                    .isEqualTo(token + System.lineSeparator());
+
+            byte[] expectedHash =
+                    MessageDigest.getInstance("SHA-256")
+                            .digest(token.getBytes(StandardCharsets.UTF_8));
+
+            // Independently verify the committed credential.
+            try (Connection verification = migratorConnection();
+                    PreparedStatement credential =
+                            verification.prepareStatement(
+                                    """
+                                    SELECT key_hash
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                      AND revoked_at IS NULL
+                                    """);
+                    PreparedStatement incident =
+                            verification.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM incidents
+                                    WHERE project_id = ?
+                                      AND fingerprint = ?
+                                    """)) {
+
+                credential.setObject(1, projectId);
+
+                try (ResultSet rows = credential.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+
+                    assertThat(rows.getBytes("key_hash"))
+                            .containsExactly(expectedHash);
+
+                    assertThat(rows.next()).isFalse();
+                }
+
+                // The probe INSERT succeeded, but was rolled back.
+                incident.setObject(1, projectId);
+                incident.setString(2, fingerprint);
+
+                try (ResultSet rows = incident.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                    assertThat(rows.getLong(1)).isZero();
+                }
+            }
+
+            assertThat(stderr.toString(StandardCharsets.UTF_8))
+                    .contains(
+                            "committed for project " + projectId)
+                    .doesNotContain(token)
+                    .doesNotContainPattern("th_[A-Za-z0-9_-]{43}");
+
+            assertThat(underlyingConnection.get()).isNotNull();
+            assertThat(underlyingConnection.get().isClosed()).isTrue();
+
+        } finally {
+            Connection actual = underlyingConnection.get();
+
+            if (actual != null && !actual.isClosed()) {
+                actual.close();
+            }
+        }
+    }
+
+    @Test
+    void issueEscapesHostileProjectNameInDiagnostics()
+            throws Exception {
+
+        UUID projectId = UUID.randomUUID();
+
+        String hostileName =
+                "evil" + (char) 0x1b + "[31m"
+                        + "\nfake" + (char) 0x202e + "line";
+
+        insertProject(projectId, hostileName);
+
+        ByteArrayOutputStream stdout =
+                new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr =
+                new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+
+        String token =
+                stdout.toString(StandardCharsets.UTF_8)
+                        .stripTrailing();
+
+        assertThat(token).matches("th_[A-Za-z0-9_-]{43}");
+
+        String diagnostics =
+                stderr.toString(StandardCharsets.UTF_8);
+
+        // Control characters must be visible, inert and single-line.
+        assertThat(diagnostics)
+                .contains(
+                        "(name=evil\\u{1b}[31m\\nfake\\u{202e}line)")
+                .doesNotContain(
+                        String.valueOf((char) 0x1b),
+                        String.valueOf((char) 0x202e),
+                        token);
+
+        assertThat(diagnostics.lines()).hasSize(1);
+    }
+
+    private String issueToken(UUID projectId) {
+        ByteArrayOutputStream stdout = new ByteArrayOutputStream();
+        ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+
+        int exitCode;
+
+        try (PrintStream out =
+                        new PrintStream(
+                                stdout, true, StandardCharsets.UTF_8);
+                PrintStream err =
+                        new PrintStream(
+                                stderr, true, StandardCharsets.UTF_8)) {
+
+            exitCode = CredentialAdmin.run(
+                    issueArgs(projectId),
+                    environment(),
+                    out,
+                    err);
+        }
+
+        assertThat(exitCode).isZero();
+        return stdout.toString(StandardCharsets.UTF_8).stripTrailing();
+    }
+
+    private static String[] issueArgs(UUID projectId) {
+        return new String[] {
+            "issue", "--project", projectId.toString()
+        };
+    }
+
+    private Map<String, String> environment() {
+        return Map.of(
+                "DB_HOST", postgresContainer.getHost(),
+                "DB_PORT",
+                String.valueOf(postgresContainer.getMappedPort(5432)),
+                "DB_NAME", postgresContainer.getDatabaseName(),
+                "DB_MIGRATOR_USER", "triageharbor_migrator",
+                "DB_MIGRATOR_PASSWORD", PASSWORD);
+    }
+
+    private Connection migratorConnection() throws SQLException {
+        return DriverManager.getConnection(
+                postgresContainer.getJdbcUrl(),
+                "triageharbor_migrator",
+                PASSWORD);
+    }
+
+    private void insertProject(UUID projectId, String name)
+            throws SQLException {
+
+        try (Connection connection = migratorConnection();
+                PreparedStatement statement =
+                        connection.prepareStatement(
+                                """
+                                INSERT INTO projects (id, name)
+                                VALUES (?, ?)
+                                """)) {
+
+            statement.setObject(1, projectId);
+            statement.setString(2, name);
+
+            assertThat(statement.executeUpdate()).isEqualTo(1);
+        }
+    }
+
+    private final class CommitObservingOutputStream
+            extends OutputStream {
+
+        private final UUID projectId;
+        private final ByteArrayOutputStream delegate =
+                new ByteArrayOutputStream();
+
+        private boolean firstWriteObserved;
+        private boolean committedAtFirstWrite;
+
+        private CommitObservingOutputStream(UUID projectId) {
+            this.projectId = projectId;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            observeCommit();
+            delegate.write(value);
+        }
+
+        @Override
+        public void write(byte[] bytes, int offset, int length)
+                throws IOException {
+
+            observeCommit();
+            delegate.write(bytes, offset, length);
+        }
+
+        private void observeCommit() throws IOException {
+            if (firstWriteObserved) {
+                return;
+            }
+
+            firstWriteObserved = true;
+
+            try (Connection connection = migratorConnection();
+                    PreparedStatement statement =
+                            connection.prepareStatement(
+                                    """
+                                    SELECT count(*)
+                                    FROM project_ingest_credentials
+                                    WHERE project_id = ?
+                                    """)) {
+
+                statement.setObject(1, projectId);
+
+                try (ResultSet rows = statement.executeQuery()) {
+                    if (!rows.next()) {
+                        throw new IOException(
+                                "Commit observation returned no row");
+                    }
+
+                    committedAtFirstWrite = rows.getInt(1) == 1;
+                }
+            } catch (SQLException exception) {
+                throw new IOException(
+                        "Could not inspect committed issuance",
+                        exception);
+            }
+        }
+
+        private boolean firstWriteObserved() {
+            return firstWriteObserved;
+        }
+
+        private boolean committedAtFirstWrite() {
+            return committedAtFirstWrite;
+        }
+
+        private String content() {
+            return delegate.toString(StandardCharsets.UTF_8);
+        }
+    }
+}

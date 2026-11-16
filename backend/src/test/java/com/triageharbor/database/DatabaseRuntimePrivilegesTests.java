@@ -9,6 +9,7 @@ import com.triageharbor.event.EventIngestService;
 import com.triageharbor.event.IngestCredentialResolver;
 import com.triageharbor.incident.IncidentReadService;
 import com.triageharbor.incident.IncidentSummary;
+import com.triageharbor.support.IngestCredentialFixtures;
 import com.triageharbor.support.RoleSeparatedPostgresTestConfiguration;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -51,7 +52,7 @@ class DatabaseRuntimePrivilegesTests {
     void cleanUpAsAdmin() throws SQLException {
         try (Connection admin = adminConnection();
                 Statement statement = admin.createStatement()) {
-            statement.execute("TRUNCATE TABLE events, incidents, projects");
+            statement.execute("TRUNCATE TABLE events, incidents, project_ingest_credentials, projects");
         }
     }
 
@@ -91,7 +92,32 @@ class DatabaseRuntimePrivilegesTests {
         assertPermissionDenied(
                 () ->
                         jdbcTemplate.update(
-                                "UPDATE projects SET ingest_key = gen_random_uuid()"));
+                                """
+                                INSERT INTO project_ingest_credentials (
+                                    project_id,
+                                    key_hash,
+                                    key_prefix
+                                )
+                                VALUES (
+                                    gen_random_uuid(),
+                                    decode(repeat('00', 32), 'hex'),
+                                    'th_abcdefgh'
+                                )
+                                """));
+
+        assertPermissionDenied(
+                () ->
+                        jdbcTemplate.update(
+                                """
+                                UPDATE project_ingest_credentials
+                                SET revoked_at = now()
+                                """));
+
+        assertPermissionDenied(
+                () ->
+                        jdbcTemplate.update(
+                                "DELETE FROM project_ingest_credentials"));
+
 
         assertPermissionDenied(
                 () ->
@@ -129,7 +155,9 @@ class DatabaseRuntimePrivilegesTests {
                                 Long.class));
     }
 
-    private ProjectCredential insertProjectAsAdmin(String name) throws SQLException {
+
+    private ProjectCredential insertProjectAsAdmin(String name)
+            throws SQLException {
         UUID projectId = UUID.randomUUID();
 
         try (Connection admin = adminConnection();
@@ -138,19 +166,18 @@ class DatabaseRuntimePrivilegesTests {
                                 """
                                 INSERT INTO projects (id, name)
                                 VALUES (?, ?)
-                                RETURNING ingest_key
                                 """)) {
 
             statement.setObject(1, projectId);
             statement.setString(2, name);
 
-            try (ResultSet resultSet = statement.executeQuery()) {
-                assertThat(resultSet.next()).isTrue();
+            assertThat(statement.executeUpdate()).isEqualTo(1);
 
-                return new ProjectCredential(
-                        projectId,
-                        resultSet.getObject("ingest_key", UUID.class));
-            }
+            String ingestKey =
+                    IngestCredentialFixtures.insertForProject(
+                            admin, projectId);
+
+            return new ProjectCredential(projectId, ingestKey);
         }
     }
 
@@ -187,5 +214,5 @@ class DatabaseRuntimePrivilegesTests {
                         });
     }
 
-    private record ProjectCredential(UUID projectId, UUID ingestKey) {}
+    private record ProjectCredential(UUID projectId, String ingestKey) {}
 }

@@ -81,7 +81,7 @@ final class MigrationVerifier {
         }
 
         LOGGER.info(
-                "Flyway migration verification succeeded: mode=migrate, current={}, pending=0",
+                "Flyway migration verification succeeded: current={}, pending=0",
                 current.getVersion());
     }
 

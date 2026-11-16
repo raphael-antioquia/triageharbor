@@ -72,7 +72,7 @@ class GlobalIngestRateLimitHttpTests {
         assertThat(globalRejectionCount()).isEqualTo(initialGlobalRejections);
 
         // Global 429 must win over the size filter's 413.
-        String ingestKey = UUID.randomUUID().toString();
+        String ingestKey = "th_" + "A".repeat(43);
         HttpResponse<byte[]> rejected = send(oversizedPost(ingestKey));
 
         assertThat(rejected.statusCode()).isEqualTo(429);

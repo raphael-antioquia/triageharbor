@@ -1,7 +1,7 @@
 -- Portable database role/security contract verifier (PostgreSQL 17+: uses MAINTAIN).
 -- Plain SQL only, so the same file runs through JDBC and psql.
 -- One row per check (check_name | passed); NULL is reported as failure.
--- The row count (45) is part of the contract: changing it is a deliberate contract change.
+-- The row count (47) is part of the contract: changing it is a deliberate contract change.
 
 WITH
 context AS (
@@ -155,6 +155,7 @@ expected_tables (table_name) AS (
         ('events'),
         ('flyway_schema_history'),
         ('incidents'),
+        ('project_ingest_credentials'),
         ('projects')
 ),
 table_objects AS (
@@ -242,7 +243,7 @@ default_acl_checks AS (
     FROM context AS c
 ),
 
--- Ownership (4 rows)
+-- Ownership (5 rows)
 ownership_checks AS (
     SELECT
         'owner_' || table_name || '_migrator' AS check_name,
@@ -251,14 +252,15 @@ ownership_checks AS (
     FROM table_objects
 ),
 
--- Exact app table privileges (4 rows)
+-- Exact app table privileges (5 rows)
 app_table_allowlist (table_name, privilege) AS (
     VALUES
         ('projects', 'SELECT'),
         ('incidents', 'SELECT'),
         ('incidents', 'INSERT'),
         ('incidents', 'UPDATE'),
-        ('events', 'INSERT')
+        ('events', 'INSERT'),
+        ('project_ingest_credentials', 'SELECT')
 ),
 table_privileges (privilege) AS (
     VALUES

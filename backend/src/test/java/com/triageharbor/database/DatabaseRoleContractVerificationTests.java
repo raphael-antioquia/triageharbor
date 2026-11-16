@@ -31,7 +31,7 @@ class DatabaseRoleContractVerificationTests {
     private static final String VERIFIER_RESOURCE =
             "/db/verification/database-role-contract.sql";
 
-    private static final int EXPECTED_CHECK_COUNT = 45;
+    private static final int EXPECTED_CHECK_COUNT = 47;
 
     @Autowired
     private PostgreSQLContainer postgresContainer;
@@ -110,6 +110,12 @@ class DatabaseRoleContractVerificationTests {
                 arguments(
                         "app_table_privileges_exact:projects",
                         "GRANT SELECT (name) ON projects TO triageharbor_app WITH GRANT OPTION"),
+                arguments(
+                        "app_table_privileges_exact:project_ingest_credentials",
+                        "GRANT UPDATE (revoked_at) ON project_ingest_credentials TO triageharbor_app"),
+                arguments(
+                        "app_table_privileges_exact:project_ingest_credentials",
+                        "REVOKE SELECT ON project_ingest_credentials FROM triageharbor_app"),
 
                 // Database/schema grant options.
                 arguments(

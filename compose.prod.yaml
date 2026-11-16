@@ -3,16 +3,19 @@
 #
 # Database identities are fixed:
 #   triageharbor_admin     image bootstrap superuser; postgres + role-bootstrap only
-#   triageharbor_migrator  Flyway + explicit project provisioning
+#   triageharbor_migrator  Flyway, explicit project provisioning, credential-admin
 #   triageharbor_app       runtime; migrate context + backend
 #
-# Database role commissioning on an EMPTY volume:
+# Commissioning on an EMPTY volume (full procedure: prod/credential-operations.md):
 #   1. up -d --wait postgres
 #   2. --profile role-bootstrap run --rm role-bootstrap
 #   3. run --rm migrate
 #   4. --profile project-provision run --rm -T project-provision
-#   5. up -d
+#   5. --profile credential-admin run --rm --no-deps -T credential-admin
+#        issue --project <id>    (stdout to a private file, never a terminal)
+#   6. up -d
 #
+# Provisioning never issues credentials; ingestion returns 401 until one is issued.
 # role-bootstrap provisions database identities only; it is one stage of
 # production commissioning, not all of it.
 #
@@ -147,6 +150,36 @@ services:
         read_only: true
         bind:
           create_host_path: false
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Explicit operator-only credential lifecycle.
+  # Not a dependency of migration or normal services.
+  credential-admin:
+    image: ghcr.io/raphael-antioquia/triageharbor-backend@${BACKEND_DIGEST:?BACKEND_DIGEST is required}
+    profiles: ["credential-admin"]
+    restart: "no"
+
+    entrypoint:
+      - java
+      - -cp
+      - application.jar
+      - com.triageharbor.CredentialAdmin
+
+    # Never default to issue, list, or revoke.
+    command: []
+
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:?DB_NAME is required}
+      DB_MIGRATOR_USER: triageharbor_migrator
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:?DB_MIGRATOR_PASSWORD is required}
+
+    logging:
+      driver: "none"
 
     depends_on:
       postgres:
