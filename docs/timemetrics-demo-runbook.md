@@ -8,7 +8,7 @@ It is a procedure, not evidence that a later demonstration occurred. Every run m
 
 **Last inspected implementation:** TimeMetrics commit `f48682841a15dae77706260df3319d462a701cc6`, Next.js 16.3.3, Node.js 24, `@vercel/functions` 3.11.3.
 
-**Safety boundary:** The branch contains two routes that intentionally return HTTP `500`. Never merge them into `main`, expose them without Vercel deployment protection, or broaden the reporter to capture arbitrary errors. Never reuse the revoked Phase 1 credential.
+**Safety boundary:** The branch contains two routes that intentionally return HTTP `500`. Never merge them into `main`, expose them without Vercel deployment protection, or broaden the reporter to capture arbitrary errors. Never reuse the revoked November 2026 demonstration credential.
 
 ## Status meanings
 

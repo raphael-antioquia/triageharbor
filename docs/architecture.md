@@ -136,13 +136,13 @@ The backend deployment uses an image identified by content digest. The frontend/
 
 GitHub Actions checks and publishes container images to GHCR. The inspected workflows do not automatically deploy those images to the production host.
 
-**Deployment evidence boundary:** The inspected file named *TriageHarbor Production Acceptance (2026-11-19)* is actually a TimeMetrics implementation handoff. It states that implementation and deployment were not performed and leaves its acceptance table pending. No separate execution record was available to establish fresh commissioning, exact deployed images, or the original production credential and Caddy checks. The later TimeMetrics demonstration below supplies narrower evidence for the public ingest and dashboard path, not for that earlier milestone or for current production state.
+**Deployment evidence:** Historical acceptance on November 19, 2026 verified fresh commissioning of commit `e2305b0` on a single DigitalOcean host. The exercised path included role bootstrap, Flyway V1–V4 migration verification, project provisioning, credential issuance, public HTTPS ingestion, credential rejection, Caddy route checks, and scoped revocation with a surviving primary credential. Dashboard login and incident visibility were operator-reported. This establishes a dated walking-skeleton acceptance, not current production state, continuous availability, live database ACLs, or untested failure behavior.
 
 For exact operational procedures, see [Credential Operations](../prod/credential-operations.md).
 
 ### Historical TimeMetrics synthetic client path
 
-TimeMetrics Phase 1 was a synthetic-only integration performed on November 19–20, 2026. The implementation remains on the unmerged branch `test/triageharbor-preview-ingest` at commit `f486828`. Its two intentional crash routes are demonstration code, not deployed production TimeMetrics application code and not authorization to forward real errors.
+A controlled synthetic TimeMetrics integration ran on November 19–20, 2026. The implementation remains on the unmerged branch `test/triageharbor-preview-ingest` at commit `f486828`. Its two intentional crash routes are demonstration code, not deployed production TimeMetrics application code and not authorization to forward real errors.
 
 The inspected branch implements this path:
 
@@ -169,9 +169,9 @@ The source establishes the following mechanisms:
 - HTTP, network, timeout, response-cleanup, reporter-registration, and selected Sentry failures are reduced to controlled outcomes in the tested paths. Those tests do not prove universal containment for every platform shutdown, log sink, or arbitrary error object.
 - The delivery promise is passed to Vercel `waitUntil` rather than awaited by `onRequestError`. This improves its opportunity to finish within the Function lifetime; it is not durable queuing or a delivery guarantee.
 
-Deployment protection and credential scope are separate operational boundaries, not properties enforced by this source. The historical record says the test used Vercel **Require Log In** and a dedicated branch-scoped Preview credential. Current Vercel configuration was not inspected. A fresh replay must verify protection and issue a new dedicated credential before deploying; the revoked Phase 1 credential must never be reused.
+Deployment protection and credential scope are separate operational boundaries, not properties enforced by this source. Historical operator evidence indicates that the test used Vercel **Require Log In** and a dedicated branch-scoped Preview credential. Current Vercel configuration was not inspected. A fresh replay must verify protection and issue a new dedicated credential before deploying; the revoked November 2026 demonstration credential must never be reused.
 
-The historical evidence record describes screenshots showing intentional application HTTP `500` responses, separate reporter HTTP `202` outcomes, persisted dashboard incidents, and positive Sentry capture. It also records observed handler aggregation from one to four occurrences while the render incident remained at one. These runtime observations are classified in [Testing and Verification](testing.md#historical-acceptance-evidence); source inspection alone does not establish that the historical deployment ran.
+Preserved screenshot evidence shows intentional application HTTP `500` responses, separate reporter HTTP `202` outcomes, persisted dashboard incidents, and positive Sentry capture. The handler incident increased from one to four occurrences while the render incident remained at one. These runtime observations are classified in [Testing and Verification](testing.md#historical-acceptance-evidence); source inspection alone does not establish that the historical deployment ran.
 
 Avoiding client retries is deliberate. TriageHarbor has no client event identifier or deduplication constraint, so a timeout after a committed ingest is ambiguous. Retrying could record a second event and increment the incident again. Best-effort single-attempt delivery is therefore safer than automatic retry until retry-safe accounting exists.
 
@@ -727,7 +727,7 @@ The Spring servlet filters still apply to the forwarded `/events` path, includin
 
 However, the Caddy-specific request-body limit configured for public `/events` does not apply to the `/api/*` handler.
 
-The inspected historical evidence does not establish production edge routing or successful persistence through this alias. Embedded-Tomcat path tests exercise application routing, not the Caddy boundary.
+Historical acceptance testing showed an authenticated `POST /api/events` being forwarded by Caddy to Spring's `/events` controller and returning backend `401` without an ingest key. Successful persistence through this alias was not attempted. Embedded-Tomcat path tests remain separate from that dated edge observation.
 
 Restricting `/api/*` to the intended read methods is a deferred edge change. Until then, documentation should not claim that `/events` is the only route capable of reaching ingestion.
 
@@ -771,7 +771,9 @@ Performance changes should follow measurement rather than assumed scaling needs.
 
 CI validates and publishes images, but does not automatically roll them out to the production host.
 
-The separate initial production-acceptance milestone is not established by the inspected records. The later TimeMetrics Phase 1 exercise supplies dated synthetic evidence for public HTTPS ingestion, dashboard persistence and grouping, and parallel Sentry capture, subject to the evidence limitations recorded in [Testing and Verification](testing.md#historical-acceptance-evidence).
+November 19 production acceptance established a dated synthetic walking skeleton covering fresh commissioning, public HTTPS ingestion, dashboard visibility, credential rejection and revocation, and the tested Caddy routes. It did not establish continuous availability, production load performance, current external state, or the production cases left untested.
+
+The later TimeMetrics demonstration supplies a separate dated synthetic client result for protected Vercel-to-TriageHarbor delivery, dashboard persistence and grouping, and parallel Sentry capture, subject to the evidence limitations recorded in [Testing and Verification](testing.md#historical-acceptance-evidence).
 
 That exercise did not approve arbitrary real-error collection or establish an always-on TimeMetrics integration. Production capture still requires an explicit privacy and disposability decision, safe handling of React-processed messages and stacks, redaction and truncation tests for arbitrary payloads, and an approved capture scope.
 

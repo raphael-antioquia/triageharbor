@@ -6,7 +6,7 @@ TriageHarbor receives application error events, groups related failures into inc
 
 Built with Java, Spring Boot, and PostgreSQL, it is a backend-focused portfolio project emphasizing enforceable data integrity, concurrency-safe persistence, credential management, integration testing, and deployment.
 
-A November 19–20, 2026 synthetic-only integration used a protected TimeMetrics Vercel Preview to exercise TriageHarbor's public HTTPS ingestion and incident dashboard. It was a controlled historical demonstration, not approval for production real-error collection or a guarantee of delivery.
+Production acceptance in November 2026 verified fresh commissioning and synthetic HTTPS ingestion. A later controlled demonstration connected a protected TimeMetrics Vercel Preview to the live ingest path. Neither milestone approved arbitrary production error collection or established guaranteed delivery.
 
 ## Overview
 
@@ -398,13 +398,28 @@ The image-publication workflow separately repeats those checks before packaging 
 
 ### Deployment status
 
-The inspected records do not establish a separate initial production-acceptance milestone. The file carrying that title is an unexecuted TimeMetrics implementation handoff with a pending acceptance table, so it cannot support claims about fresh commissioning, exact deployed artifacts, or the original credential and Caddy checks.
+**Initial production walking-skeleton acceptance was completed on November 19, 2026.**
 
-The later TimeMetrics Phase 1 record provides narrower historical evidence from November 19–20, 2026. In a deployment-protected Preview, an intentional render failure and Route Handler failure each returned application HTTP `500`; the reporter separately logged TriageHarbor HTTP `202` outcomes. Dashboard observations showed two distinct persisted incidents. Three additional handler requests were followed by the handler incident increasing from one occurrence to four while the render incident remained at one. Sentry independently showed both original synthetic error types.
+The accepted deployment used commit `e2305b0` on a single DigitalOcean host with Docker Compose, PostgreSQL 17.11, the Spring Boot backend, React, and Caddy. Commissioning completed role bootstrap, Flyway V1–V4 migration with `current=4, pending=0`, project provisioning, and initial credential issuance.
 
-Current inspection of the retained TimeMetrics branch confirms the strict synthetic allowlist, fixed three-field payload, Node-only reporting, one 2,500 ms HTTPS attempt, Vercel `waitUntil` registration, and no automatic retry. The branch is unmerged and its intentional crash routes are not production TimeMetrics application code.
+Acceptance checks through the public HTTP/2 HTTPS boundary included:
 
-The historical credential inventory showed the dedicated Preview credential revoked while a pre-existing credential remained active. A post-revocation reporter HTTP `401` was operator-reported, but its exact timestamp, unchanged incident counts, and Sentry result for that final request were not retained as independent evidence. Current production state was not inspected for this documentation.
+- Caddy Basic Auth rejecting an unauthenticated dashboard request.
+- A synthetic event returning HTTP `202` and appearing in the dashboard with one occurrence; dashboard login and visibility were operator-reported.
+- Malformed and well-formed unknown ingest credentials returning backend HTTP `401`.
+- Caddy route-variant behavior, including authenticated `/api/events` forwarding to Spring; persistence through that alias was not attempted.
+- A temporary credential succeeding with `202`, being revoked, then returning `401`, while the primary credential continued to return `202`.
+- Exact raw credential values absent from the inspected Docker service logs.
+
+The accepted backend artifact was `ghcr.io/raphael-antioquia/triageharbor-backend@sha256:aa9acee069c0855aad1fe638f90fe99d10a2053a8b00538130a8ad8c5691b10b`; the frontend/edge artifact was `ghcr.io/raphael-antioquia/triageharbor-frontend:a05553989c37b57907d982583dc445b2ee8c312f`. The deployment used `https://triageharbor.com`.
+
+During a later controlled TimeMetrics demonstration, a deployment-protected Preview generated one intentional render failure and one Route Handler failure. Each application request returned HTTP `500`, while the reporter separately received TriageHarbor HTTP `202`. The dashboard showed two distinct persisted incidents. Three additional handler requests increased that incident from one occurrence to four while the render incident remained at one. Sentry independently captured both synthetic error types.
+
+The demonstration client used a strict synthetic allowlist, fixed three-field payload, Node-only reporting, one 2,500 ms HTTPS attempt, Vercel `waitUntil` registration, and no automatic retry. Its retained branch is unmerged, and the intentional crash routes are not production TimeMetrics application code.
+
+After the demonstration, the dedicated Preview credential was revoked while the primary acceptance credential remained active. A post-revocation reporter HTTP `401` was operator-reported, but its exact timestamp, unchanged incident counts, and Sentry result for that final request were not retained as independent evidence.
+
+These are historical acceptance results; current production state was not re-inspected for this documentation update.
 
 The production Compose configuration separates database bootstrap, migration, project provisioning, credential administration, and normal serving. Operational commands and recovery procedures are maintained in [Credential operations](prod/credential-operations.md).
 
