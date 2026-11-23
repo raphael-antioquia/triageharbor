@@ -6,7 +6,7 @@ TriageHarbor receives application error events, groups related failures into inc
 
 Built with Java, Spring Boot, and PostgreSQL, it is a backend-focused portfolio project emphasizing enforceable data integrity, concurrency-safe persistence, credential management, integration testing, and deployment.
 
-A November 19, 2026 operator acceptance report records successful end-to-end deployment and synthetic-event testing. Real TimeMetrics integration remains the next milestone.
+A November 19–20, 2026 synthetic-only integration used a protected TimeMetrics Vercel Preview to exercise TriageHarbor's public HTTPS ingestion and incident dashboard. It was a controlled historical demonstration, not approval for production real-error collection or a guarantee of delivery.
 
 ## Overview
 
@@ -150,7 +150,7 @@ Monitored application
    React dashboard
 ```
 
-The public ingestion endpoint uses an ingest credential, whereas the deployed dashboard and its read path use Caddy Basic Auth.
+The public ingestion endpoint uses an ingest credential, whereas the production Caddy configuration protects the dashboard and its read path with Basic Auth.
 
 The Spring read API scopes its SQL queries by project ID but does not yet perform application-level user/project ownership authorization.
 
@@ -398,48 +398,33 @@ The image-publication workflow separately repeats those checks before packaging 
 
 ### Deployment status
 
-**Initial production walking-skeleton acceptance was reported complete on November 19, 2026.**
+The inspected records do not establish a separate initial production-acceptance milestone. The file carrying that title is an unexecuted TimeMetrics implementation handoff with a pending acceptance table, so it cannot support claims about fresh commissioning, exact deployed artifacts, or the original credential and Caddy checks.
 
-The operator-provided acceptance report records a deployment to a single DigitalOcean host using Docker Compose, PostgreSQL 17.11, the Spring Boot backend, React, and Caddy.
+The later TimeMetrics Phase 1 record provides narrower historical evidence from November 19–20, 2026. In a deployment-protected Preview, an intentional render failure and Route Handler failure each returned application HTTP `500`; the reporter separately logged TriageHarbor HTTP `202` outcomes. Dashboard observations showed two distinct persisted incidents. Three additional handler requests were followed by the handler incident increasing from one occurrence to four while the render incident remained at one. Sentry independently showed both original synthetic error types.
 
-It reports successful synthetic-event ingestion over public HTTPS, incident visibility in the authenticated dashboard, credential rejection checks, and credential revocation followed by continued ingestion with a separate active credential.
+Current inspection of the retained TimeMetrics branch confirms the strict synthetic allowlist, fixed three-field payload, Node-only reporting, one 2,500 ms HTTPS attempt, Vercel `waitUntil` registration, and no automatic retry. The branch is unmerged and its intentional crash routes are not production TimeMetrics application code.
 
-This is dated operator-provided evidence; the production environment has not been independently inspected for this README.
-
-Public dashboard: [triageharbor.com](https://triageharbor.com)
-
-The backend artifact reported for that deployment was:
-
-```text
-ghcr.io/raphael-antioquia/triageharbor-backend@sha256:aa9acee069c0855aad1fe638f90fe99d10a2053a8b00538130a8ad8c5691b10b
-```
-
-The frontend/edge image was reported as:
-
-```text
-ghcr.io/raphael-antioquia/triageharbor-frontend:a05553989c37b57907d982583dc445b2ee8c312f
-```
-
-The backend artifact's publication workflow succeeded in GitHub Actions. The reported production digest and deployed state come from the operator acceptance record.
+The historical credential inventory showed the dedicated Preview credential revoked while a pre-existing credential remained active. A post-revocation reporter HTTP `401` was operator-reported, but its exact timestamp, unchanged incident counts, and Sentry result for that final request were not retained as independent evidence. Current production state was not inspected for this documentation.
 
 The production Compose configuration separates database bootstrap, migration, project provisioning, credential administration, and normal serving. Operational commands and recovery procedures are maintained in [Credential operations](prod/credential-operations.md).
+
+See [Testing and Verification](docs/testing.md#historical-acceptance-evidence) for the evidence classification and [TimeMetrics synthetic demo runbook](docs/timemetrics-demo-runbook.md) for a controlled replay procedure.
 
 ### Current limitations
 
 TriageHarbor remains an evolving backend system, with important boundaries:
 
 - **No ingestion retry idempotency:** Repeating an accepted event creates another event and increases the incident count. A retry after an ambiguous HTTP outcome may double-count.
+- **Best-effort client delivery:** The demonstrated TimeMetrics reporter makes one bounded HTTP attempt without automatic retries. `waitUntil` improves the opportunity to finish but does not guarantee delivery.
 - **No automatic incident reopening:** Matching new events do not currently change a resolved incident back to open.
 - **No application-level read authorization:** Deployment-level Caddy Basic Auth protects the dashboard, but the backend read endpoint does not independently authorize project ownership.
 - **Instance-local rate limits:** Bucket4j quotas do not provide coordinated limits across multiple backend instances.
 - **Pattern-based redaction only:** The scrubber covers defined patterns and cannot guarantee removal of all secrets or personal information.
 - **Limited investigation UI:** The current dashboard displays incident summaries, not individual raw-event details or incident-management controls.
 - **No background processing pipeline:** Queues, leased workers, notifications, and automated recovery workflows are not part of the implemented walking skeleton.
-- **Additional edge hardening deferred:** The deployed `/api/*` proxy can also forward an authenticated `POST /api/events` to the ingestion endpoint. Restricting that route to read methods remains deferred.
+- **Additional edge hardening deferred:** The production Caddy configuration can also forward an authenticated `POST /api/events` to the ingestion endpoint. Restricting that route to read methods remains deferred.
 
-Production acceptance currently covers controlled synthetic events, not an established pipeline for arbitrary real-world errors.
-
-TimeMetrics is the intended first real monitored application.
+The historical TimeMetrics exercise covered only two fixed, allowlisted synthetic errors. It did not establish safe handling of arbitrary messages or stacks, an always-on integration, real-error capture, deduplication, exactly-once accounting, durable delivery, or a monitoring SLO.
 
 ## Further Reading
 
@@ -448,6 +433,7 @@ TimeMetrics is the intended first real monitored application.
 - [Architecture](docs/architecture.md) — Components, request flows, trust boundaries, and design tradeoffs.
 - [Database](docs/database.md) — Schema, integrity constraints, atomic aggregation, and privileges.
 - [Testing](docs/testing.md) — Verification matrix, concurrency evidence, negative controls, and limits.
+- [TimeMetrics synthetic demo runbook](docs/timemetrics-demo-runbook.md) — Safe replay, evidence capture, revocation, and cleanup.
 
 ### Existing operational and development documentation
 

@@ -14,7 +14,9 @@ Claims in this document rest on three kinds of evidence, kept distinct throughou
 
 - **Checked-in sources at `e2305b0`:** implementation, migrations, and test assertions. Test classes are named where they support a claim; this document is not an inventory of every test.
 - **CI runs on matching contents:** Backend CI run [`43967175273`](https://github.com/raphael-antioquia/triageharbor/actions/runs/43967175273) succeeded on [PR #12](https://github.com/raphael-antioquia/triageharbor/pull/12)'s final head `ea5880c`, with formatting, static-analysis, and test steps reporting success. GitHub's comparison of `ea5880c` with merge commit `e2305b0` reports no changed files, so that run exercised the same file contents as this baseline. The [post-merge Backend CI run](https://github.com/raphael-antioquia/triageharbor/actions/runs/43971516028) on `main` also succeeded.
-- **The November 19, 2026 production acceptance report:** dated, operator-provided observations of the deployed system, not an independently reproduced deployment test.
+- **Historical TimeMetrics evidence:** a November 22 evidence record and November 19–20 completion handoff preserve descriptions of screenshots, operator output, operator reports, and reported TimeMetrics test execution. The original screenshots and raw logs were not available for this documentation pass, so the evidence classes remain explicit below.
+
+The inspected file named `TriageHarbor_Production_Acceptance_2026-11-19.md` is not an execution record. It is a TimeMetrics implementation handoff that states implementation and deployment were not performed and leaves its acceptance table pending. A distinct initial TriageHarbor production-acceptance milestone is therefore not treated as established evidence in this document.
 
 ## Testing Approach
 
@@ -391,6 +393,55 @@ They support the historical rationale for the concurrency suite, but the mutatio
 
 A historical manual control must not be counted as a permanent CI protection.
 
+## Historical Acceptance Evidence
+
+The following matrices keep two milestones separate:
+
+1. The purported initial TriageHarbor production acceptance on November 19, 2026.
+2. The later synthetic-only TimeMetrics Phase 1 run on November 19–20, 2026.
+
+Implementation and automated-test evidence can establish mechanisms without proving that a historical deployment executed them. Conversely, a historical screenshot or operator observation can establish a dated result without proving every internal mechanism or the system's current state.
+
+The TimeMetrics evidence record indexes screenshots from the original integration conversation, but those image files and the raw Vercel/Sentry logs were not available during this repository update. References to screenshots below therefore describe the preserved record; they are not a new independent inspection of the original assets.
+
+### TriageHarbor production acceptance
+
+The similarly named acceptance file is an unexecuted TimeMetrics design handoff, not evidence that a fresh TriageHarbor deployment passed. Later TimeMetrics results exercise parts of the deployed TriageHarbor path, but cannot retroactively establish the missing commissioning milestone.
+
+| Property | Enforcement | Verification | Evidence | Status | Limitations |
+|---|---|---|---|---|---|
+| Public HTTPS ingestion | Caddy public `/events` route; Spring ingest controller | Current source inspection; later TimeMetrics requests received reporter HTTP `202` outcomes | `frontend/Caddyfile`, ingest source, Phase 1 screenshot descriptions | **Later path observed; initial milestone unverified** | Does not establish fresh commissioning, the original acceptance date, continuous availability, or current deployment state |
+| Credential authentication and rejection | Canonical token shape, SHA-256 lookup, `revoked_at IS NULL`, empty HTTP `401` | Backend HTTP and revocation tests; later post-revoke `401` reported by operator | Resolver/controller tests; Phase 1 report | **Implemented and CI-tested; live denial only operator-reported** | The historical `401` timestamp and its ordering after revocation were not retained; the claimed original production rejection checks lack an execution record |
+| Persistence and incident grouping | Transactional incident UPSERT plus event INSERT; project/version/fingerprint uniqueness | PostgreSQL integration tests; later dashboard observations | Current code and CI evidence; Phase 1 incident screenshots described in the record | **Implemented and CI-tested; later synthetic result observed** | The later run is not evidence of the missing initial acceptance, arbitrary payload safety, or exactly-once ingestion |
+| Dashboard behavior | Project-scoped read SQL, React summary UI, Caddy Basic Auth boundary | Backend read tests; later dashboard screenshots | Read service/controller/UI source; Phase 1 screenshot descriptions | **Implemented and tested; later incident display observed** | No application-level project ownership authorization; current public dashboard and original acceptance view were not inspected |
+| Migration and deployment readiness | Flyway V1–V4, migration verifier, Compose migration-success gate, digest-selected backend | Migration/configuration tests; Phase 1 record summarizes operator output `current=4, pending=0` | Migrations, tests, `compose.prod.yaml`, operator-output summary | **Implemented and tested; fresh production commissioning unverified** | Source and tests do not prove the claimed initial host setup, image identities, live ACLs, or post-acceptance state |
+| Operational credential safeguards | Inventory, unique-file issue, scoped revoke, last-key guard, recovery procedures | CLI/database tests; Phase 1 final inventory summarized from operator output | Credential tests and authoritative operations runbook; Phase 1 evidence record | **Implemented and tested; later inventory observed through operator output** | The Preview issuance receipt was deleted before a later ID comparison; original acceptance lifecycle details remain unsupported |
+| Caddy route-variant acceptance | Current `handle /events` and `handle_path /api/*` rules | No available execution record for the claimed production route-variant checks | Caddy source and embedded-Tomcat path tests only | **Not historically verified from inspected evidence** | Embedded application routing does not establish edge behavior; persistence through `/api/events` was not demonstrated |
+
+### TimeMetrics Phase 1
+
+The retained TimeMetrics branch was inspected separately from the TriageHarbor repository. It remains unmerged at `f48682841a15dae77706260df3319d462a701cc6`, based on `main` commit `6b8cf63dac22b2588ba898d0ef9cd639b8e82ac1`. Reporter and instrumentation commits are `fa5730f` and `db76ca1`. The historical acceptance deployment ID was `dpl_EjAUdtzfmngKMpsXUzXF4GvBYKVj`; the record says that deployment was later deleted.
+
+| Property | Enforcement | Verification | Evidence | Status | Limitations |
+|---|---|---|---|---|---|
+| Exact synthetic capture boundary | Exact message, route type, and route path match; fixed three-field JSON | Current branch source inspection; reported TimeMetrics unit-test execution | Reporter source/tests at retained branch | **Implemented; tests present and historical pass reported** | Establishes only the two fixed synthetic cases, not safe handling of arbitrary real errors |
+| Node-only, independent Sentry composition | `NEXT_RUNTIME === "nodejs"`; separate contained Sentry and reporter paths | Current source/tests; positive live Sentry observations | Instrumentation source/tests and Phase 1 screenshot descriptions | **Implemented; tests present and positive live cases observed** | Sentry capture for the final failed-ingest request was not independently retained |
+| One bounded delivery attempt | One `fetch`, 2,500 ms abort signal, `redirect: "error"`, no retry; promise registered with `waitUntil` | Current source/tests; reported lint, typecheck, build, and 153 Vitest tests across 16 TimeMetrics files | Reporter/instrumentation tests and historical execution summary | **Implemented; historical test run reported passed** | The 153 tests are TimeMetrics tests, not TriageHarbor backend tests; no live timeout or universal platform-failure test |
+| Protected Preview and branch-only credential | Vercel Require Log In plus dedicated branch-scoped Preview Secret | Operator verification recorded for the historical deployment | Phase 1 evidence and completion handoff | **Operator-reported historical configuration** | Not enforced by Git source; current Vercel settings and absence of broader token scope were not inspected |
+| Intentional render and handler failures | Two branch-only routes throw fixed sentinels | Vercel screenshots described at the recorded deployment | Phase 1 screenshot index and timestamps | **Observed — preserved screenshot record** | Intentional application HTTP `500` is test input, not an ingest failure; routes must never be merged to `main` |
+| Reporter transport acceptance | HTTPS POST outcome logged independently from the application response | One `triageharbor:sent:202` shown for each initial route | Vercel screenshot descriptions | **Observed — preserved screenshot record** | HTTP `202` alone does not independently prove persistence or unique delivery |
+| Two persisted incident identities | TriageHarbor fingerprints the fixed exception type/message within one project | Dashboard showed distinct render and handler incidents, initially one occurrence each | TriageHarbor dashboard screenshot descriptions | **Observed — preserved screenshot record** | Screenshots do not independently expose the fingerprint algorithm; source establishes that separately |
+| Repeated-request grouping | Database UPSERT increments the matching incident | Handler count changed `1 → 4`; render remained `1` | Final dashboard screenshot description | **Observed count aggregation** | The three individual additional `sent:202` log entries were not retained; this is not per-request traceability or exactly-once proof |
+| Positive Sentry preservation | Existing Sentry reporter remains independently invoked | Matching render and handler issues, one initial event each | Sentry screenshot descriptions | **Observed for the two positive cases** | Does not establish Sentry behavior after the final HTTP `401` or under every failure mode |
+| Dedicated credential lifecycle | Separate credential permits scoped revocation while a pre-existing credential remains active | Final inventory showed the Preview credential revoked and one pre-existing credential active | Operator-output summary in Phase 1 record | **Observed — operator output** | Deleted issuance receipt prevents a later independent receipt-to-revocation ID comparison; inventory is not source attribution for events |
+| Post-revocation denial | Active-credential lookup rejects a revoked token with HTTP `401` | Operator reported `triageharbor:status:401` from the old deployment | Completion handoff and evidence record | **Reported — operator only** | Exact `401` timestamp, post-`401` counts, and final-request Sentry result were not independently retained |
+| Secret, deployment, and token cleanup | Revoke before deleting deployment/Secret snapshots; delete exact token files | Droplet file absence was checked; Vercel and laptop cleanup were operator-confirmed | Operator-output and operator-report summaries | **Mixed: droplet absence observed; other cleanup reported** | Current external state was not re-queried; cleanup claims must retain their evidence class |
+| Retained demonstration branch | Git branch kept separate from `main` | Local and remote-tracking refs inspected at `f486828`; branch is not merged | Current TimeMetrics Git state | **Verified by current source inspection** | Retention does not mean an old deployment or credential remains active; a future push may trigger a new Preview |
+
+Phase 1 did **not** establish real production error collection, safe serialization of arbitrary messages or stacks, guaranteed delivery, exactly-once ingestion, deduplication, retry-safe occurrence counts, durable queuing, monitoring SLOs, universal network-failure containment, or an always-on public demo.
+
+For a controlled future run, use the [TimeMetrics Synthetic Demo Runbook](timemetrics-demo-runbook.md). A future demo creates new evidence; it cannot repair missing evidence from the 2026 Phase 1 run retroactively.
+
 ## Verification Boundaries
 
 Verification evidence has different strengths and scopes.
@@ -400,7 +451,7 @@ Verification evidence has different strengths and scopes.
 | Static source inspection | Code paths, SQL, constraints, test assertions, intended mechanisms | That the behavior passed when executed |
 | Local automated test output | Observed behavior in the reported local setup | CI equivalence or production deployment |
 | GitHub Actions | Successful checks on a specific commit and runner environment | Production runtime correctness or untested interleavings |
-| Production acceptance | Observed external behavior in a dated deployed environment | Exhaustive security, concurrency, or failure guarantees |
+| Historical deployed observation | A specifically recorded external behavior in a dated environment | Unrecorded steps, exhaustive guarantees, or current external state |
 
 The properties in the [Verification Matrix](#verification-matrix) are verified by automated tests that passed in CI on contents matching `e2305b0`, under their test conditions. The sections below record what that evidence leaves open, separated by why.
 
@@ -415,17 +466,17 @@ The properties in the [Verification Matrix](#verification-matrix) are verified b
 - **Redaction execution-time bounds:** adversarial timeout tests are regression guards, not production latency or throughput measurements.
 - **Routing variants:** path-variant tests establish embedded-Tomcat behavior, not identical behavior at the Caddy boundary.
 
-### Verified only by dated operator observation
+### Historical external observations
 
-The November 19 acceptance report records synthetic HTTPS ingestion, incident display behind Caddy Basic Auth, invalid and unknown credential rejection, revocation with a surviving sibling credential, and Caddy route-variant behavior, including authenticated `POST /api/events` being forwarded to Spring ingestion. No automated test exercises the Caddy proxy topology. These are observations of a specific deployed configuration on that date, not continuous verification of current production state.
+The available historical evidence and its limits are classified in [Historical Acceptance Evidence](#historical-acceptance-evidence). No automated test exercises the complete Caddy → Spring → PostgreSQL production topology, and the missing initial acceptance record is not reconstructed from later observations.
 
 ### Not tested
 
-- **Persistence through the `/api/events` alias:** routing was observed in production; a successful authenticated ingest through the alias was not attempted.
+- **Production behavior through the `/api/events` alias:** neither edge routing nor successful persistence through this alias is established by the inspected historical evidence.
 - **Production admission behavior:** 413, 429, their precedence, and CORS preflight were not exercised in production.
 - **Live production database ACLs:** the role contract has run against the test topology, not an inspected production ACL snapshot.
 - **Multiple deployed backend processes:** PostgreSQL constraints provide the mechanism, but multi-instance ingestion, sustained load, and connection-pool saturation have not been exercised.
-- **Real-event payload safety and TimeMetrics delivery:** production acceptance used controlled synthetic data.
+- **Real-event payload safety:** TimeMetrics Phase 1 used two fixed synthetic cases and did not authorize or test arbitrary production error capture.
 - **Frontend automated tests:** `frontend/package.json` defines build and lint scripts but no test script.
 
 ### Not implemented
