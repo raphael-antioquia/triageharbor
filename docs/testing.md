@@ -419,7 +419,7 @@ Historical acceptance evidence covers fresh commissioning of commit `e2305b0` an
 
 ### TimeMetrics synthetic integration
 
-The retained TimeMetrics branch was inspected separately from the TriageHarbor repository. It remains unmerged at `f48682841a15dae77706260df3319d462a701cc6`, based on `main` commit `6b8cf63dac22b2588ba898d0ef9cd639b8e82ac1`. Reporter and instrumentation commits are `fa5730f` and `db76ca1`. The historical deployment ID was `dpl_EjAUdtzfmngKMpsXUzXF4GvBYKVj`; operator cleanup notes say that deployment was later deleted.
+The historical TimeMetrics demonstration implementation was inspected separately from the TriageHarbor repository at commit `f48682841a15dae77706260df3319d462a701cc6`, based on `main` commit `6b8cf63dac22b2588ba898d0ef9cd639b8e82ac1`. Reporter and instrumentation commits are `fa5730f` and `db76ca1`. The historical deployment ID was `dpl_EjAUdtzfmngKMpsXUzXF4GvBYKVj`; operator cleanup notes say that deployment was later deleted. As of November 24, 2026, the remote demonstration branch is absent, but the historical commit remained accessible through authenticated repository access.
 
 | Property | Enforcement | Verification | Evidence | Status | Limitations |
 |---|---|---|---|---|---|
@@ -435,7 +435,7 @@ The retained TimeMetrics branch was inspected separately from the TriageHarbor r
 | Dedicated credential lifecycle | Separate credential permits scoped revocation while a pre-existing credential remains active | Final inventory showed the Preview credential revoked and one pre-existing credential active | Preserved operator inventory output | **Observed — operator output** | Deleted issuance receipt prevents a later independent receipt-to-revocation ID comparison; inventory is not source attribution for events |
 | Post-revocation denial | Active-credential lookup rejects a revoked token with HTTP `401` | Operator reported `triageharbor:status:401` from the old deployment | Preserved operator report | **Reported — operator only** | Exact `401` timestamp, post-`401` counts, and final-request Sentry result were not independently retained |
 | Secret, deployment, and token cleanup | Revoke before deleting deployment/Secret snapshots; delete exact token files | Droplet file absence was checked; Vercel and laptop cleanup were operator-confirmed | Operator-output and operator-report summaries | **Mixed: droplet absence observed; other cleanup reported** | Current external state was not re-queried; cleanup claims must retain their evidence class |
-| Retained demonstration branch | Git branch kept separate from `main` | Local and remote-tracking refs inspected at `f486828`; branch is not merged | Current TimeMetrics Git state | **Verified by current source inspection** | Retention does not mean an old deployment or credential remains active; a future push may trigger a new Preview |
+| Historical demonstration branch | Git branch kept separate from `main` | Historical refs inspected at `f486828`; remote branch absent on November 24, 2026 | Historical Git inspection and dated remote-ref check | **Historical implementation; remote branch absent** | Local branch retention is unverified; replay requires recovering and revalidating the demonstration source |
 
 The demonstration did **not** establish real production error collection, safe serialization of arbitrary messages or stacks, guaranteed delivery, exactly-once ingestion, deduplication, retry-safe occurrence counts, durable queuing, monitoring SLOs, universal network-failure containment, or an always-on public demo.
 

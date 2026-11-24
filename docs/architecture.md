@@ -142,9 +142,9 @@ For exact operational procedures, see [Credential Operations](../prod/credential
 
 ### Historical TimeMetrics synthetic client path
 
-A controlled synthetic TimeMetrics integration ran on November 19–20, 2026. The implementation remains on the unmerged branch `test/triageharbor-preview-ingest` at commit `f486828`. Its two intentional crash routes are demonstration code, not deployed production TimeMetrics application code and not authorization to forward real errors.
+A controlled synthetic TimeMetrics integration ran on November 19–20, 2026. The implementation was reviewed on the unmerged branch `test/triageharbor-preview-ingest` at commit `f486828`. As of November 24, 2026, the remote branch is no longer present on GitHub, although the historical commit remained accessible through authenticated repository access. Its two intentional crash routes were demonstration code, not deployed production TimeMetrics application code and not authorization to forward real errors.
 
-The inspected branch implements this path:
+The inspected historical implementation used this path:
 
 ```text
 Intentional Next.js server exception

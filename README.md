@@ -415,7 +415,7 @@ The accepted backend artifact was `ghcr.io/raphael-antioquia/triageharbor-backen
 
 During a later controlled TimeMetrics demonstration, a deployment-protected Preview generated one intentional render failure and one Route Handler failure. Each application request returned HTTP `500`, while the reporter separately received TriageHarbor HTTP `202`. The dashboard showed two distinct persisted incidents. Three additional handler requests increased that incident from one occurrence to four while the render incident remained at one. Sentry independently captured both synthetic error types.
 
-The demonstration client used a strict synthetic allowlist, fixed three-field payload, Node-only reporting, one 2,500 ms HTTPS attempt, Vercel `waitUntil` registration, and no automatic retry. Its retained branch is unmerged, and the intentional crash routes are not production TimeMetrics application code.
+The demonstration client used a strict synthetic allowlist, fixed three-field payload, Node-only reporting, one 2,500 ms HTTPS attempt, Vercel `waitUntil` registration, and no automatic retry. The demonstration was implemented on a separate, unmerged test branch at commit f486828. The remote branch is no longer present on GitHub as of November 24, 2026. The intentional crash routes are not production TimeMetrics application code.
 
 After the demonstration, the dedicated Preview credential was revoked while the primary acceptance credential remained active. A post-revocation reporter HTTP `401` was operator-reported, but its exact timestamp, unchanged incident counts, and Sentry result for that final request were not retained as independent evidence.
 
