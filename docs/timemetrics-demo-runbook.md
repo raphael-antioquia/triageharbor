@@ -4,7 +4,7 @@ This runbook repeats the historical synthetic-only TimeMetrics demonstration aga
 
 It is a procedure, not evidence that a later demonstration occurred. Every run must create its own dated evidence record.
 
-**Applies to:** the retained TimeMetrics branch `test/triageharbor-preview-ingest`, a deployment-protected Vercel Preview, and a TriageHarbor environment whose operator has approved the demonstration.
+**Applies to:** A recovered or locally retained TimeMetrics demonstration branch named `test/triageharbor-preview-ingest`, a deployment-protected Vercel Preview, and a TriageHarbor environment whose operator has approved the demonstration.
 
 **Last inspected implementation:** TimeMetrics commit `f48682841a15dae77706260df3319d462a701cc6`, Next.js 16.3.3, Node.js 24, `@vercel/functions` 3.11.3.
 
@@ -51,9 +51,11 @@ Before changing anything, identify:
 
 Stop if any identity or environment is ambiguous.
 
-## 2. Validate the retained TimeMetrics branch
+## 2. Validate the demonstration branch
 
 On the TimeMetrics workstation:
+
+The remote demonstration branch was absent on November 24, 2026. Before replaying the demonstration, confirm that the reviewed source is available locally or can be recovered from the historical commit identified above. If it cannot be recovered, stop. Review the recovered source and confirm Vercel deployment protection before pushing a branch that could trigger a new Preview deployment. Never merge the synthetic routes into `main`.
 
 ```bash
 git switch test/triageharbor-preview-ingest
