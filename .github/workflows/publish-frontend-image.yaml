@@ -41,6 +41,7 @@ jobs:
         run: npm run lint
 
   publish:
+    if: github.ref == 'refs/heads/main'
     needs: lint
     runs-on: ubuntu-latest
 
