@@ -461,3 +461,11 @@ The implementation, Flyway migrations, tests, Docker configuration, and GitHub A
 ---
 
 **TriageHarbor is built to demonstrate engineering depth through explicit invariants, deliberate failure testing, and evidence-backed implementation decisions.**
+
+## License
+
+TriageHarbor is proprietary software made publicly available for educational reference and portfolio demonstration.
+
+Copyright © 2026 Raphael Antioquia. All rights reserved.
+
+See [LICENSE](LICENSE) for details.
